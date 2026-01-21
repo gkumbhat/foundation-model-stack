@@ -137,13 +137,6 @@ models.register_model(_architecture_name, "24b", _mistral3_factory_factory(_24b_
 # =============== Serialization ==================
 
 
-serialization.register_adapter_step(
-    _architecture_name,
-    "swiglu_unfused_to_fused",
-    serialization._mlp_glu_unfused_to_fused_adapter_step,
-)
-
-
 def _weight_fusion(
     input_sd: Mapping[str, Any], model_config: Optional[Mistral3Config] = None, **kwargs
 ) -> Mapping[str, Any]:
