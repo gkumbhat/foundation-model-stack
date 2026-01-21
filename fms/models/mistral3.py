@@ -62,7 +62,7 @@ class Mistral3(nn.Module):
         distributed_strategy: DistributedStrategy = NoOpStrategy,
         **kwargs,
     ):
-        super(Mistral3, self).__init__()
+        super().__init__()
 
         if config is not None:
             self.config = config
@@ -70,7 +70,9 @@ class Mistral3(nn.Module):
             self.config = Mistral3Config()
 
         self.config = self.config.updated(**kwargs)
-        self.config.text_config = self.config.text_config.updated(**kwargs)
+
+        if not self.config.fused_weights:
+            self.config.text_config.fused_weights = False
 
         self.distributed_strategy = distributed_strategy
 
