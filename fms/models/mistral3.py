@@ -16,10 +16,12 @@ from fms.distributed.strategy import (
 from fms.modules.attention import AttentionKwargs
 
 from fms.utils import serialization
+from fms.utils.activation import str_to_activation
 from fms.utils.config import ModelConfig
 
+from fms.modules.layernorm import LayerNormParameterized
 from fms.models.mistral import MistralConfig, Mistral
-
+from fms.models.pixtral_vision import PixtralVisionConfig
 
 logger = logging.getLogger(__name__)
 
@@ -32,24 +34,16 @@ class Mistral3Config(ModelConfig):
     This wraps a Mistral (text) config for Mistral3 - Pixtral is not added yet.
     Fields default to the standard HF Mistral3 settings unless overridden.
     """
-
-    # ----- model identity -----
-    model_type: str = "mistral3"
-    tie_heads: bool = False
-
-    # ----- sub-configs -----
     text_config: MistralConfig = field(default_factory=MistralConfig)
-
-    # ----- multimodal projector / merger knobs -----
+    vision_config: PixtralVisionConfig = field(default_factory=PixtralVisionConfig)
     projector_hidden_act: str = "gelu"
     multimodal_projector_bias: bool = False
     spatial_merge_size: int = 2
-
-    # ----- image token plumbing -----
     image_token_index: int = 10
-    vision_feature_layer: int = -1  # -1 means "use last hidden state" by default
-
-    fused_weights: bool = True  # FMS Specific -- For CPU/GPU = T, AIU = F
+    vision_feature_layer: int | list[int] = -1
+    tie_heads: bool = False
+    ### FMS Specific
+    fused_weights: bool = True  # True For CPU/GPU = T, False for AIU
 
 
 _24b_config = Mistral3Config()
@@ -97,11 +91,59 @@ class Mistral3(nn.Module):
 
     def prepare_inputs_for_generation(
         self,
-        iteration,
-        input_ids,
-        kwargs,
+        iteration: int,
+        input_ids: torch.Tensor,
+        kwargs: dict[str, Any],
     ):
-        raise NotImplementedError("TODO - Embed w/ pixtral as prefill hook")
+        # NOTE: This is written to be compatible with Transformers, which
+        # is how we should handle preprocessing here; not mistral-commons
+        pixel_values = kwargs.get("pixel_values", None)
+        image_sizes = kwargs.get("image_sizes", None)
+        input_embeds = kwargs.get("inputs", None)
+
+        embeds = self._get_text_embeddings(input_ids, input_embeds)
+        img_features = self._get_image_features(pixel_values, image_sizes)
+        if img_features is not None:
+            embeds = self._merge_multimodal_embeddings(
+                input_ids,
+                embeds,
+                img_features,
+                dtype=img_features.dtype,
+                device=img_features.device
+            )
+        return embeds, kwargs
+
+    def _get_text_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor | None,
+    ):
+        # Precomputed embeddings take priority over input IDs
+        if input_embeds is not None:
+            return input_embeds
+        return self.language_model.base_model.embedding(input_ids)
+
+    def _get_image_features(
+        self,
+        pixel_values: torch.Tensor | None,
+        image_sizes: torch.Tensor | None,
+    ):
+        if pixel_values is not None:
+            raise NotImplementedError("Image encoder not implemented")
+        return None
+
+    def _merge_multimodal_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        text_embeds: torch.Tensor,
+        img_features: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        special_image_mask = (input_ids == self.config.image_token_index).unsqueeze(-1)
+        special_image_mask = special_image_mask.expand_as(text_embeds).to(device)
+        image_features = img_features.to(device, dtype)
+        return text_embeds.masked_scatter(special_image_mask, image_features)
 
     def forward(
         self,
