@@ -48,6 +48,99 @@ class Mistral3Config(ModelConfig):
 
 _24b_config = Mistral3Config()
 
+# Patch Merger and Projector are largely derived
+# from Transformers (v4) implementation.
+class Mistral3PatchMerger(nn.Module):
+    """
+    Learned merging of spatial_merge_size ** 2 patches
+    """
+    def __init__(self, config: Mistral3Config):
+        super().__init__()
+        self.config = config
+
+        hidden_size = config.vision_config.hidden_size
+        self.spatial_merge_size = config.spatial_merge_size
+        self.patch_size = self.config.vision_config.patch_size
+        self.merging_layer = nn.Linear(
+            hidden_size * self.spatial_merge_size**2,
+            hidden_size,
+            bias=False,
+        )
+
+    def forward(self, image_features: torch.Tensor, image_sizes: torch.Tensor) -> torch.Tensor:
+        img_sizes = [
+            (image_size[0] // self.patch_size, image_size[1] // self.patch_size) for image_size in image_sizes
+        ]
+
+        tokens_per_image = [h * w for h, w in img_sizes]
+        d = image_features.shape[-1]
+
+        permuted_tensor = []
+        for image_index, image_tokens in enumerate(image_features.split(tokens_per_image)):
+            # Reshape image_tokens into a 2D grid
+            h, w = img_sizes[image_index]
+            image_grid = image_tokens.view(h, w, d).permute(2, 0, 1).unsqueeze(0)
+            # NOTE (Alex / Gaurav) check if unfold is compatible with AIU compile
+            grid = torch.nn.functional.unfold(
+                image_grid, kernel_size=self.spatial_merge_size, stride=self.spatial_merge_size
+            )
+            grid = grid.view(d * self.spatial_merge_size**2, -1).t()
+            permuted_tensor.append(grid)
+
+        image_features = torch.cat(permuted_tensor, dim=0)
+        image_features = self.merging_layer(image_features)
+        return image_features
+
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.merging_layer.weight)
+
+
+class Mistral3MultiModalProjector(nn.Module):
+    def __init__(self, config: Mistral3Config):
+        super().__init__()
+        self.config = config
+        self.patch_merger = Mistral3PatchMerger(config)
+        self.norm = LayerNormParameterized(
+            self.config.vision_config.hidden_size,
+            elementwise_scale=True,
+            elementwise_shift=False,
+            use_mean=False,
+            eps=self.config.text_config.norm_eps,
+            use_high_precision_pow=True,
+        )
+
+        self.config = config
+        num_feature_layers = (
+            1 if isinstance(config.vision_feature_layer, int) else len(config.vision_feature_layer)
+        )
+        self.linear_1 = nn.Linear(
+            config.vision_config.hidden_size * num_feature_layers,
+            config.text_config.emb_dim,
+            bias=config.multimodal_projector_bias,
+        )
+        self.act = str_to_activation(config.projector_hidden_act)
+        self.linear_2 = nn.Linear(
+            config.text_config.emb_dim,
+            config.text_config.emb_dim,
+            bias=config.multimodal_projector_bias,
+        )
+
+    def forward(self, image_features: torch.Tensor, image_sizes: torch.Tensor):
+        image_features = self.norm(image_features)
+        image_features = self.patch_merger(image_features, image_sizes)
+        hidden_states = self.linear_1(image_features)
+        hidden_states = self.act(hidden_states)
+        hidden_states = self.linear_2(hidden_states)
+        return hidden_states
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.linear_1.weight)
+        nn.init.xavier_uniform_(self.linear_2.weight)
+        if self.config.multimodal_projector_bias:
+            nn.init.normal_(self.linear_1.bias, std=1e-6)
+            nn.init.normal_(self.linear_2.bias, std=1e-6)
+
 
 class Mistral3(nn.Module):
     def __init__(
@@ -73,6 +166,10 @@ class Mistral3(nn.Module):
         # Currently, we always use mistral for the LLM
         self.language_model = Mistral(
             self.config.text_config, self.distributed_strategy
+        )
+        # Vision encoder and projector for multimodal features
+        self.multi_modal_projector = Mistral3MultiModalProjector(
+            self.config,
         )
 
     @classmethod
