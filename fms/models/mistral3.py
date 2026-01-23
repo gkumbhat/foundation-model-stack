@@ -199,15 +199,18 @@ class Mistral3(nn.Module):
         input_embeds = kwargs.get("inputs", None)
 
         embeds = self._get_text_embeddings(input_ids, input_embeds)
-        img_features = self._get_image_features(pixel_values, image_sizes)
-        if img_features is not None:
-            embeds = self._merge_multimodal_embeddings(
-                input_ids,
-                embeds,
-                img_features,
-                dtype=img_features.dtype,
-                device=img_features.device
-            )
+        
+        # Only consider image features at decode time
+        if iteration == 0:
+            img_features = self._get_image_features(pixel_values, image_sizes)
+            if img_features is not None:
+                embeds = self._merge_multimodal_embeddings(
+                    input_ids,
+                    embeds,
+                    img_features,
+                    dtype=embeds.dtype,
+                    device=embeds.device
+                )
         return embeds, kwargs
 
     def _get_text_embeddings(
@@ -225,9 +228,32 @@ class Mistral3(nn.Module):
         pixel_values: torch.Tensor | None,
         image_sizes: torch.Tensor | None,
     ):
-        if pixel_values is not None:
-            raise NotImplementedError("Image encoder not implemented")
-        return None
+        raise NotImplementedError("vision tower has not been implemented yet.")
+        # NOTE: Below is WIP and has been tested with stubbed inputs from HF's
+        # Encoder, so it should be (mostly) functionally correct.
+        _, _, image_features = self.vision_tower(
+            pixel_values, output_hidden_states=True
+        )
+
+        # Handle multiple vision feature layers
+        if isinstance(self.config.vision_feature_layer, int):
+            selected_image_feature = image_features[self.config.vision_feature_layer]
+        else:
+            hs_pool = [
+                image_features[layer_idx]
+                for layer_idx in self.config.vision_feature_layer
+            ]
+            selected_image_feature = torch.cat(hs_pool, dim=-1)
+
+        # Run the multimodal projector on selected features
+        image_features = self.multi_modal_projector(selected_image_feature, image_sizes)
+
+        # Split out the stacked image features
+        downsample_ratio = self.config.vision_config.patch_size * self.config.spatial_merge_size
+        split_sizes = [(height // downsample_ratio) * (width // downsample_ratio) for height, width in image_sizes]
+        image_features = torch.split(image_features.squeeze(0), split_sizes)
+        image_features = torch.cat(image_features, dim=0)
+        return image_features
 
     def _merge_multimodal_embeddings(
         self,
