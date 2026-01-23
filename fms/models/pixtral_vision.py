@@ -18,7 +18,7 @@ class PixtralVisionConfig(ModelConfig):
     nheads: int = 16
     nchannels: int = 3
     image_size: int = 1540
-    patch_size: int = 16
+    patch_size: int = 14
     hidden_act: str = "silu"
     layer_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
