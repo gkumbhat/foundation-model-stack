@@ -21,7 +21,7 @@ from fms.utils.config import ModelConfig
 
 from fms.modules.layernorm import LayerNormParameterized
 from fms.models.mistral import MistralConfig, Mistral
-from fms.models.pixtral_vision import PixtralVisionConfig
+from fms.models.pixtral_vision import PixtralVisionConfig, PixtralVisionModel
 
 logger = logging.getLogger(__name__)
 
@@ -169,8 +169,11 @@ class Mistral3(nn.Module):
 
         self.config = self.config.updated(**kwargs)
 
+        # Ensure weight fusion correctly propogates;
+        # NOTE: since pixtral is only run as a standalone model
         if not self.config.fused_weights:
             self.config.text_config.fused_weights = False
+            self.config.vision_config.fused_weights = False
 
         self.distributed_strategy = distributed_strategy
 
@@ -179,6 +182,9 @@ class Mistral3(nn.Module):
             self.config.text_config, self.distributed_strategy
         )
         # Vision encoder and projector for multimodal features
+        self.vision_tower = PixtralVisionModel(
+            self.config.vision_config, self.distributed_strategy
+        )
         self.multi_modal_projector = Mistral3MultiModalProjector(
             self.config,
         )
@@ -212,7 +218,7 @@ class Mistral3(nn.Module):
         embeds = self._get_text_embeddings(input_ids, input_embeds)
 
         # Only consider image features at decode time
-        if iteration == 0:
+        if iteration == 0 and pixel_values is not None:
             img_features = self._get_image_features(pixel_values, image_sizes)
             if img_features is not None:
                 embeds = self._merge_multimodal_embeddings(
@@ -236,14 +242,16 @@ class Mistral3(nn.Module):
 
     def _get_image_features(
         self,
-        pixel_values: torch.Tensor | None,
+        pixel_values: torch.Tensor,
         image_sizes: torch.Tensor | None,
     ):
-        raise NotImplementedError("vision tower has not been implemented yet.")
-        # NOTE: Below is WIP and has been tested with stubbed inputs from HF's
-        # Encoder, so it should be (mostly) functionally correct.
-        _, _, image_features = self.vision_tower(
-            pixel_values, output_hidden_states=True
+        # NOTE: 2 response values since unlike siglip/clip, we have no pooler;
+        # we should refactor this to be wrapped in a class so that we can use
+        # image encoders across different models more generically.
+        _, image_features = self.vision_tower(
+            pixel_values=pixel_values,
+            image_sizes=image_sizes,
+            output_hidden_states=True,
         )
 
         # Handle multiple vision feature layers
@@ -256,7 +264,13 @@ class Mistral3(nn.Module):
             ]
             selected_image_feature = torch.cat(hs_pool, dim=-1)
 
-        # Run the multimodal projector on selected features
+        # Run the multimodal projector on selected features;
+        # squeeze batch dim for the image -> [sz, img_features].
+        # This is okay to do because pixtral flattens convolutional
+        # patches in the multi-image case, so img_features will be
+        # equal to the total number of image tokens and split by the
+        # projector's patch processor.
+        selected_image_feature = selected_image_feature.squeeze(0)
         image_features = self.multi_modal_projector(selected_image_feature, image_sizes)
 
         # Split out the stacked image features
