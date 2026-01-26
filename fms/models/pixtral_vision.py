@@ -9,7 +9,7 @@ from fms.modules.attention import (
 )
 from fms.modules.feedforward import GatedLinearUnit
 from fms.modules.layernorm import LayerNormParameterized
-from fms.modules.positions import RotaryEmbedding
+from fms.modules.positions import PixtralRotaryEmbedding
 from fms.utils.activation import str_to_activation
 
 import torch
@@ -19,6 +19,16 @@ from typing import Any, Unpack
 
 logger = logging.getLogger(__name__)
 
+# Ref: https://github.com/huggingface/transformers/blob/v5.0.0/src/transformers/models/pixtral/modeling_pixtral.py#L37
+def position_ids_in_meshgrid(patch_embeds_list, max_width):
+    positions = []
+    for patch in patch_embeds_list:
+        height, width = patch.shape[-2:]
+        mesh = torch.meshgrid(torch.arange(height), torch.arange(width), indexing="ij")
+        h_grid, v_grid = torch.stack(mesh, dim=-1).reshape(-1, 2).chunk(2, -1)
+        ids = h_grid * max_width + v_grid
+        positions.append(ids[:, 0])
+    return torch.cat(positions)
 
 @dataclass
 class PixtralVisionConfig(ModelConfig):
@@ -56,7 +66,7 @@ class PixtralRMSNorm(LayerNormParameterized):
 
 
 class PixtralAttentionLayer(nn.Module):
-    def __init__(self, config: PixtralVisionConfig):
+    def __init__(self, config: PixtralVisionConfig, rotary_emb: PixtralRotaryEmbedding):
         super().__init__()
         self.config = config
         head_dim = self.config.hidden_size // self.config.nheads
@@ -74,6 +84,7 @@ class PixtralAttentionLayer(nn.Module):
             nheads=config.nheads,
             kvheads=config.nheads,
             p_dropout=self.config.attention_dropout,
+            position_encoder=rotary_emb,
             linear_config=self.config.linear_config,
             fused=self.config.fused_weights,
             scale_factor=head_dim**-0.5,
@@ -96,11 +107,16 @@ class PixtralAttentionLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        position_ids=None,
         **attn_kwargs: Unpack[AttentionKwargs],
     ):
         residual = hidden_states
         hidden_states = self.attention_norm(hidden_states)
-        hidden_states = self.attn(q=hidden_states, **attn_kwargs)
+        hidden_states = self.attn(
+            q=hidden_states,
+            position_ids=position_ids,
+            **attn_kwargs,
+        )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -116,16 +132,17 @@ class PixtralAttentionLayer(nn.Module):
 
 
 class PixtralTransformer(nn.Module):
-    def __init__(self, config: PixtralVisionConfig):
+    def __init__(self, config: PixtralVisionConfig, rotary_emb: PixtralRotaryEmbedding):
         super().__init__()
         self.config = config
         self.layers = nn.ModuleList(
-            [PixtralAttentionLayer(config) for _ in range(config.nlayers)]
+            [PixtralAttentionLayer(config, rotary_emb) for _ in range(config.nlayers)]
         )
 
     def forward(
         self,
         inputs_embeds,
+        position_ids=None,
         output_hidden_states=False,
         **attn_kwargs: Unpack[AttentionKwargs],
     ):
@@ -138,7 +155,11 @@ class PixtralTransformer(nn.Module):
         for encoder_layer in self.layers:
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
-            hidden_states = encoder_layer(hidden_states, **attn_kwargs)
+            hidden_states = encoder_layer(
+                hidden_states=hidden_states,
+                position_ids=position_ids,
+                **attn_kwargs,
+            )
 
         return hidden_states, encoder_states
 
@@ -168,28 +189,40 @@ class PixtralVisionModel(nn.Module):
             out_channels=self.config.hidden_size,
             kernel_size=self.config.patch_size,
             stride=self.config.patch_size,
-            padding="valid",
+            bias=False,
         )
         self.ln_pre = PixtralRMSNorm(
             normalized_shape=self.config.hidden_size,
             eps=self.config.layer_norm_eps,
         )
-        self.transformer = PixtralTransformer(self.config)
-        self.patch_positional_embedding = None  # Gaurav porting 2D rope
+
+        head_dim = self.config.hidden_size // self.config.nheads
+        self.patch_positional_embedding = PixtralRotaryEmbedding(
+            dim=head_dim,
+            ratio=self.config.rope_theta,
+            image_size=self.config.image_size,
+            patch_size=self.config.patch_size,
+        )
+
+        self.transformer = PixtralTransformer(
+            self.config,
+            self.patch_positional_embedding,
+        )
 
     def forward(
         self,
         pixel_values: torch.Tensor,
         image_sizes: torch.Tensor | list[tuple[int, int]] | None = None,
         output_hidden_states=False,
+        position_ids=None,
         **attn_kwargs: Unpack[AttentionKwargs],
     ):
-        # TODO - do we really need this?
-        attn_kwargs["attn_name"] = attn_kwargs.get("attn_name", "sdpa_bidirectional")
-
+        # Standardize inputs & dtype
         if image_sizes is None:
             batch_size, _, height, width = pixel_values.shape
             image_sizes = [(height, width)] * batch_size
+        pixel_values = pixel_values.to(dtype=self.patch_conv.weight.dtype)
+
         # Pass images through initial convolution independently + flatten
         patch_embeds = self.patch_conv(pixel_values)
         # TODO: Check / fix potential graph break in positional encoding
@@ -201,19 +234,22 @@ class PixtralVisionModel(nn.Module):
         patch_embeds = torch.cat(
             [p.flatten(1).T for p in patch_embeds_list], dim=0
         ).unsqueeze(0)
+
         patch_embeds = self.ln_pre(patch_embeds)
 
-        # Positional embedding (TODO)
-        position_embeddings = patch_embeds
+        # 2D Rope positions for image patches; the positional emb module
+        # expects this to be 2D, so we unsqueeze it for batch dim.
+        position_ids = position_ids_in_meshgrid(
+            patch_embeds_list, max_width=self.config.image_size // self.config.patch_size
+        ).unsqueeze(0)
 
         # Invoke the actual transformer
         return self.transformer(
-            position_embeddings,
+            patch_embeds,
+            position_ids=position_ids,
             output_hidden_states=output_hidden_states,
             **attn_kwargs,
         )
-
-    # TODO - probably should post init positions here maybe
 
     def reset_parameters(self):
         self.transformer.reset_parameters()

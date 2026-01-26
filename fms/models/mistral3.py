@@ -220,14 +220,14 @@ class Mistral3(nn.Module):
         # Only consider image features at decode time
         if iteration == 0 and pixel_values is not None:
             img_features = self._get_image_features(pixel_values, image_sizes)
-            if img_features is not None:
-                embeds = self._merge_multimodal_embeddings(
-                    input_ids,
-                    embeds,
-                    img_features,
-                    dtype=embeds.dtype,
-                    device=embeds.device,
-                )
+            embeds = self._merge_multimodal_embeddings(
+                input_ids,
+                embeds,
+                img_features,
+                dtype=embeds.dtype,
+                device=embeds.device,
+            )
+
         return embeds, kwargs
 
     def _get_text_embeddings(
