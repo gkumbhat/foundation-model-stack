@@ -69,7 +69,7 @@ class GraniteBlock(nn.Module):
             elementwise_shift=False,
             use_mean=False,
             eps=self.config.norm_eps,
-            use_high_precision_pow=True,
+            use_high_precision_pow=False,
         )
         self.ff_ln = LayerNormParameterized(
             self.config.emb_dim,
@@ -77,7 +77,7 @@ class GraniteBlock(nn.Module):
             elementwise_shift=False,
             use_mean=False,
             eps=self.config.norm_eps,
-            use_high_precision_pow=True,
+            use_high_precision_pow=False,
         )
 
         if self.config.kvheads == 0:
@@ -288,8 +288,10 @@ class GraniteHeadless(nn.Module):
             past_key_value_states = [None for _ in range(len(self.layers))]
 
         if x_in.dim() == 2:  # input is not already embedded
+            self.embedding.weight = torch.nn.Parameter(self.embedding.weight.to("cpu"))
             x_in = self.embedding(x_in)
         x_in = x_in * self.config.embedding_multiplier
+        x_in = x_in.to("spyre")
 
         # this is the output cache for all the decoder layers
         present_key_value_states = []

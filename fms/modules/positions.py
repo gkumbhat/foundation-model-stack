@@ -2,7 +2,6 @@ from collections import defaultdict
 import copy
 import math
 from typing import MutableMapping, Optional, Tuple
-
 import torch
 
 
@@ -123,10 +122,10 @@ class RopeNoScalingImpl:
         ratio = self.ratio
         dim = self.dim
 
-        freqs = 1.0 / (
+        freqs = (1.0 / (
             ratio
-            ** (torch.arange(0, dim, 2, device=device)[: (dim // 2)].float() / dim)
-        )
+            ** (torch.arange(0, dim, 2)[: (dim // 2)] / dim)
+        )).to(device=device)
         return freqs
 
 
@@ -264,8 +263,8 @@ class RotaryEmbedding(PositionEncoder):
                 # This only runs if a particular combination of alpha
                 # and max_seq_len hasn't been seen before
                 freqs = self.rope_scaling.compute_scaled_freqs(device, alpha)
-                t = torch.arange(scaled_max_seq_len, device=device, dtype=freqs.dtype)
-                freqs = torch.outer(t, freqs).float()
+                t = torch.arange(scaled_max_seq_len, device="cpu", dtype=freqs.dtype)
+                freqs = torch.outer(t, freqs.to("cpu")).float()
                 self.max_seq_len_cached[dev_idx] = scaled_max_seq_len
                 self.cached_freqs[dev_idx][alpha] = torch.stack(
                     [
@@ -275,7 +274,7 @@ class RotaryEmbedding(PositionEncoder):
                         torch.cos(freqs),
                     ],
                     dim=2,
-                ).view(*freqs.size(), 2, 2)
+                ).view(*freqs.size(), 2, 2).to(dtype=torch.float16)
 
         return alpha
 
