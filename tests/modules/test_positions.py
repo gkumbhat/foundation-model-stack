@@ -267,3 +267,35 @@ class PixtralRotaryEmbeddingTest(unittest.TestCase):
 
         assert q_rot2.shape == q.shape
         assert k_rot2.shape == k.shape
+
+    def test_rope_at_position_0(self):
+        """position (0,0) should have no rotation"""
+        # Configuration
+        dim = 16
+        ratio = 10_000.0
+        image_size = 16
+        patch_size = 4
+        batch_size = 1
+        num_heads = 2
+
+        rope = PixtralRotaryEmbedding(dim, ratio, image_size, patch_size)
+
+        # Create dummy query and key tensors
+        q = torch.randn(batch_size, patch_size, num_heads, dim)
+        k = torch.randn(batch_size, patch_size, num_heads, dim)
+
+        # For 1st pair
+        position_ids = torch.arange(
+            0, q.size(1), device=q.device, dtype=torch.long
+        ).unsqueeze(0)
+
+        # Apply pixtral rotary embeddings
+        q_rot, _ = rope.adjusted_qk(q, k, position_ids=position_ids)
+
+        torch.testing.assert_close(
+            q_rot[0, 0, 0, :],
+            q[0, 0, 0, :],
+            atol=1e-6,
+            rtol=1e-6,
+            msg="Position (0,0) should have no rotation",
+        )
