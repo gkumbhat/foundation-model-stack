@@ -7,6 +7,7 @@ to the model at init time.
 # Used in Llava Next for Granite vision
 from fms.models.siglip_vision import SiglipVisionConfig
 from fms.models.granite import GraniteConfig
+
 # Used for mistral3
 from fms.models.pixtral_vision import PixtralVisionConfig
 from fms.models.mistral import MistralConfig
@@ -290,6 +291,7 @@ def build_bert_params(config: PretrainedConfig, is_classify: bool = False) -> di
         config, config_params, inner_dim=config.intermediate_size
     )
 
+
 def build_pixtral_params(config: PretrainedConfig) -> dict:
     """Param builder for mapping Pixtral to FMS."""
     # NOTE: Layer norm eps is hardcoded in the Transformers class
@@ -324,9 +326,7 @@ def build_mistral3_params(config: PretrainedConfig) -> dict:
             "FMS implementation of Mistral3 currently supports only 'mistral' language model"
         )
 
-    if (
-        getattr(config.vision_config, "model_type", None) != "pixtral"
-    ):
+    if getattr(config.vision_config, "model_type", None) != "pixtral":
         raise ValueError(
             "FMS implementation of Mistral3 currently supports only 'pixtral' vision tower"
         )

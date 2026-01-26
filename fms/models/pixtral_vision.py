@@ -19,6 +19,7 @@ from typing import Any, Unpack
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class PixtralVisionConfig(ModelConfig):
     # Identical configuration to the vision encoder in
@@ -39,8 +40,10 @@ class PixtralVisionConfig(ModelConfig):
     linear_config: dict[str, Any] | None = None
     fused_weights: bool = True
 
+
 class PixtralRMSNorm(LayerNormParameterized):
     """Pixtral's RMS Norm using the FMS implementation of LayerNorm."""
+
     def __init__(self, normalized_shape: int, eps: float):
         super().__init__(
             normalized_shape,
@@ -50,6 +53,7 @@ class PixtralRMSNorm(LayerNormParameterized):
             eps=eps,
             use_high_precision_pow=True,
         )
+
 
 class PixtralAttentionLayer(nn.Module):
     def __init__(self, config: PixtralVisionConfig):
@@ -110,6 +114,7 @@ class PixtralAttentionLayer(nn.Module):
         for m in self.modules():
             m.reset_parameters()
 
+
 class PixtralTransformer(nn.Module):
     def __init__(self, config: PixtralVisionConfig):
         super().__init__()
@@ -132,7 +137,7 @@ class PixtralTransformer(nn.Module):
         hidden_states = inputs_embeds
         for encoder_layer in self.layers:
             if output_hidden_states:
-                    encoder_states = encoder_states + (hidden_states,)
+                encoder_states = encoder_states + (hidden_states,)
             hidden_states = encoder_layer(hidden_states, **attn_kwargs)
 
         return hidden_states, encoder_states
@@ -140,6 +145,7 @@ class PixtralTransformer(nn.Module):
     def reset_parameters(self):
         for layer in self.layers:
             layer.reset_parameters()
+
 
 class PixtralVisionModel(nn.Module):
     def __init__(
@@ -169,13 +175,12 @@ class PixtralVisionModel(nn.Module):
             eps=self.config.layer_norm_eps,
         )
         self.transformer = PixtralTransformer(self.config)
-        self.patch_positional_embedding = None # Gaurav porting 2D rope
-        
+        self.patch_positional_embedding = None  # Gaurav porting 2D rope
 
     def forward(
         self,
         pixel_values: torch.Tensor,
-        image_sizes: torch.Tensor | list[tuple[int, int]] | None=None,
+        image_sizes: torch.Tensor | list[tuple[int, int]] | None = None,
         output_hidden_states=False,
         **attn_kwargs: Unpack[AttentionKwargs],
     ):
@@ -193,12 +198,14 @@ class PixtralVisionModel(nn.Module):
             for embed, size in zip(patch_embeds, image_sizes)
         ]
 
-        patch_embeds = torch.cat([p.flatten(1).T for p in patch_embeds_list], dim=0).unsqueeze(0)
+        patch_embeds = torch.cat(
+            [p.flatten(1).T for p in patch_embeds_list], dim=0
+        ).unsqueeze(0)
         patch_embeds = self.ln_pre(patch_embeds)
 
         # Positional embedding (TODO)
         position_embeddings = patch_embeds
-        
+
         # Invoke the actual transformer
         return self.transformer(
             position_embeddings,
@@ -210,6 +217,7 @@ class PixtralVisionModel(nn.Module):
 
     def reset_parameters(self):
         self.transformer.reset_parameters()
+
 
 # NOTE: We do not currently offer support for Pixtral as a standalone
 # vision encoder, as this model is largely used in the composite
