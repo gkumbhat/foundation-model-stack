@@ -3,7 +3,7 @@ import unittest
 
 import torch
 
-from fms.modules.positions import RotaryEmbedding
+from fms.modules.positions import RotaryEmbedding, PixtralRotaryEmbedding
 
 
 class RotaryEmbeddingTests(unittest.TestCase):
@@ -234,3 +234,36 @@ class RotaryEmbeddingTests(unittest.TestCase):
         # being double the length is equivalent to being (approximately) half the base
         torch.testing.assert_close(adj_q, ntk_q)
         torch.testing.assert_close(adj_k, ntk_k)
+
+
+class PixtralRotaryEmbeddingTest(unittest.TestCase):
+    def test_shapes(self):
+        # Configuration
+        dim = 16
+        ratio = 10_000.0
+        image_size = 16
+        patch_size = 4
+        batch_size = 2
+        num_heads = 2
+
+        rope = PixtralRotaryEmbedding(dim, ratio, image_size, patch_size)
+
+        self.assertEqual(rope.dim, dim)
+        self.assertEqual(rope.max_patches_per_side, image_size // patch_size)
+
+        # Create dummy query and key tensors
+        q = torch.randn(batch_size, patch_size, num_heads, dim)
+        k = torch.randn(batch_size, patch_size, num_heads, dim)
+
+        # Apply pixtral rotary embeddings
+        q_rot, k_rot = rope.adjusted_qk(q, k)
+
+        assert q_rot.shape == q.shape
+        assert k_rot.shape == k.shape
+
+        # Test with explicit position_ids - this should not throw
+        position_ids = torch.arange(patch_size).unsqueeze(0).expand(batch_size, -1)
+        q_rot2, k_rot2 = rope.adjusted_qk(q, k, position_ids=position_ids)
+
+        assert q_rot2.shape == q.shape
+        assert k_rot2.shape == k.shape

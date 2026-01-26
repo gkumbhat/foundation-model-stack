@@ -34,6 +34,7 @@ class Mistral3Config(ModelConfig):
     This wraps a Mistral (text) config for Mistral3 - Pixtral is not added yet.
     Fields default to the standard HF Mistral3 settings unless overridden.
     """
+
     text_config: MistralConfig = field(default_factory=MistralConfig)
     vision_config: PixtralVisionConfig = field(default_factory=PixtralVisionConfig)
     projector_hidden_act: str = "gelu"
@@ -48,12 +49,14 @@ class Mistral3Config(ModelConfig):
 
 _24b_config = Mistral3Config()
 
+
 # Patch Merger and Projector are largely derived
 # from Transformers (v4) implementation.
 class Mistral3PatchMerger(nn.Module):
     """
     Learned merging of spatial_merge_size ** 2 patches
     """
+
     def __init__(self, config: Mistral3Config):
         super().__init__()
         self.config = config
@@ -67,22 +70,29 @@ class Mistral3PatchMerger(nn.Module):
             bias=False,
         )
 
-    def forward(self, image_features: torch.Tensor, image_sizes: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, image_features: torch.Tensor, image_sizes: torch.Tensor
+    ) -> torch.Tensor:
         img_sizes = [
-            (image_size[0] // self.patch_size, image_size[1] // self.patch_size) for image_size in image_sizes
+            (image_size[0] // self.patch_size, image_size[1] // self.patch_size)
+            for image_size in image_sizes
         ]
 
         tokens_per_image = [h * w for h, w in img_sizes]
         d = image_features.shape[-1]
 
         permuted_tensor = []
-        for image_index, image_tokens in enumerate(image_features.split(tokens_per_image)):
+        for image_index, image_tokens in enumerate(
+            image_features.split(tokens_per_image)
+        ):
             # Reshape image_tokens into a 2D grid
             h, w = img_sizes[image_index]
             image_grid = image_tokens.view(h, w, d).permute(2, 0, 1).unsqueeze(0)
             # NOTE (Alex / Gaurav) check if unfold is compatible with AIU compile
             grid = torch.nn.functional.unfold(
-                image_grid, kernel_size=self.spatial_merge_size, stride=self.spatial_merge_size
+                image_grid,
+                kernel_size=self.spatial_merge_size,
+                stride=self.spatial_merge_size,
             )
             grid = grid.view(d * self.spatial_merge_size**2, -1).t()
             permuted_tensor.append(grid)
@@ -90,7 +100,6 @@ class Mistral3PatchMerger(nn.Module):
         image_features = torch.cat(permuted_tensor, dim=0)
         image_features = self.merging_layer(image_features)
         return image_features
-
 
     def reset_parameters(self):
         nn.init.xavier_uniform_(self.merging_layer.weight)
@@ -112,7 +121,9 @@ class Mistral3MultiModalProjector(nn.Module):
 
         self.config = config
         num_feature_layers = (
-            1 if isinstance(config.vision_feature_layer, int) else len(config.vision_feature_layer)
+            1
+            if isinstance(config.vision_feature_layer, int)
+            else len(config.vision_feature_layer)
         )
         self.linear_1 = nn.Linear(
             config.vision_config.hidden_size * num_feature_layers,
@@ -199,7 +210,7 @@ class Mistral3(nn.Module):
         input_embeds = kwargs.get("inputs", None)
 
         embeds = self._get_text_embeddings(input_ids, input_embeds)
-        
+
         # Only consider image features at decode time
         if iteration == 0:
             img_features = self._get_image_features(pixel_values, image_sizes)
@@ -209,7 +220,7 @@ class Mistral3(nn.Module):
                     embeds,
                     img_features,
                     dtype=embeds.dtype,
-                    device=embeds.device
+                    device=embeds.device,
                 )
         return embeds, kwargs
 
@@ -249,8 +260,13 @@ class Mistral3(nn.Module):
         image_features = self.multi_modal_projector(selected_image_feature, image_sizes)
 
         # Split out the stacked image features
-        downsample_ratio = self.config.vision_config.patch_size * self.config.spatial_merge_size
-        split_sizes = [(height // downsample_ratio) * (width // downsample_ratio) for height, width in image_sizes]
+        downsample_ratio = (
+            self.config.vision_config.patch_size * self.config.spatial_merge_size
+        )
+        split_sizes = [
+            (height // downsample_ratio) * (width // downsample_ratio)
+            for height, width in image_sizes
+        ]
         image_features = torch.split(image_features.squeeze(0), split_sizes)
         image_features = torch.cat(image_features, dim=0)
         return image_features
