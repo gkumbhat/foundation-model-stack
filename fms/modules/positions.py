@@ -3,6 +3,7 @@ import copy
 import math
 from typing import MutableMapping, Optional, Tuple
 
+from scripts.quick_inference import max_seq_len
 import torch
 
 
@@ -362,3 +363,74 @@ class RotaryEmbedding(PositionEncoder):
             q_out = q_out.view_as(q_rope)
             k_out = k_out.view_as(k_rope)
         return q_out, k_out
+
+
+class PixtralRotaryEmbedding(RotaryEmbedding):
+    def __init__(
+        self,
+        dim,
+        ratio, # theta
+        image_size,
+        patch_size,
+        max_seq_len=4096,
+        partial_rope=1.0,
+    ):
+        """
+        This implements PixtralRotaryEmbedding, which handles frequency
+        for each pixel positions The key difference from standard RoPe is that
+        the frequencies are pre-computed for a 2D grid of image patches with height x width patches.
+
+        Each image patch gets a positional embedding based on its 2D position matrix, which
+        is then flattened to 1D for attention.
+
+        Ref: https://github.com/huggingface/transformers/blob/76ee621a09cf0716718f0e8912a981d1b29f56be/src/transformers/models/pixtral/modeling_pixtral.py#L48
+        """
+
+        self.max_patches_per_side = image_size // patch_size
+        self.partial_rope = partial_rope
+        self.dim = int(partial_rope * dim)
+        self.rope_scalling = RopeNoScalingImpl(self.dim, ratio, max_seq_len)
+
+        # TODO: Figure out scaling
+
+        self.cached_freqs = {}
+
+    def compute_freqs_cis(self, device, max_seq_len) -> int:
+        """
+        Computes inference 2D frequencies for PixtralRotaryEmbedding.
+
+        Args:
+            device: device to compute frequencies on
+            max_seq_len: maximum sequence length. Not used for pixtral rotary embedding
+        """
+
+        base = self.ratio
+
+        # Create position indices for height and width
+        h = torch.arange(self.max_patches_per_side)
+        w = torch.arange(self.max_patches_per_side)
+
+        freqs = 1.0 / (
+            base
+            ** (torch.arange(0, self.dim, 2, device=device)[: (self.dim // 2)].float() / self.dim)
+        )
+
+        # Split frequencies: even indices for height, odd indices for width
+        ## Take every other frequency starting from 0
+        freqs_h = freqs[::2]
+        ## Take every other frequency starting from 1
+        freqs_w = freqs[1::2]
+
+        # Compute product: position * frequency for each dimension
+        freqs_h = torch.outer(h, freqs_h)
+        freqs_w = torch.outer(w, freqs_w)
+
+        inv_freq = torch.cat(
+            [
+                freqs_h[:, None, :].repeat(1, self.max_patches_per_side, 1),
+                freqs_w[None, :, :].repeat(self.max_patches_per_side, 1, 1),
+            ],
+            dim=-1,
+        ).reshape(-1, self.dim // 2)
+
+        # TODO: Implement Caching
