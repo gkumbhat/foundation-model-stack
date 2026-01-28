@@ -441,8 +441,14 @@ def _hf_to_fms_rope(
         linear_type = "torch_linear"
 
     rope_params = _get_rope_params(linear_type)
+    # Match on either the language model or vision tower attn qk
     trans_required_pattern = re.compile(
-        f"language_model.base_model.layers.[0-9]+.attn.in_proj.(query|key).({'|'.join(rope_params)})"
+        "|".join(
+            [
+                f"language_model.base_model.layers.[0-9]+.attn.in_proj.(query|key).({'|'.join(rope_params)})",
+                f"vision_tower.transformer.layers.[0-9]+.attn.in_proj.(query|key).({'|'.join(rope_params)})",
+            ]
+        )
     )
     for name, param in input_sd.items():
         # hf -> fms requires a transpose operation for the query and key
