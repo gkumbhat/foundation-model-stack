@@ -364,29 +364,6 @@ class RotaryEmbedding(PositionEncoder):
             k_out = k_out.view_as(k_rope)
         return q_out, k_out
 
-
-class PixtralRopeNoScalingImpl:
-    """Pixtral actually doesn't do scaling, but this is meant to 1:1 match the scaling behavior of RopeNoScalingImpl"""
-
-    def __init__(
-        self,
-        dim,
-        ratio,
-        image_size,
-        max_patches_per_side=32,
-        scaling_info: dict = defaultdict(),
-    ):
-        self.dim = dim
-        self.ratio = ratio
-        self.image_size = image_size
-        self.max_patches_per_side = max_patches_per_side
-        self.scaling_info = scaling_info
-
-    def get_alpha(self, _):
-        # Currently this is same scaling as RopeNoScalingImpl
-        return 1
-
-
 class PixtralRotaryEmbedding(RotaryEmbedding):
     def __init__(
         self,
@@ -414,7 +391,8 @@ class PixtralRotaryEmbedding(RotaryEmbedding):
         self.max_patches_per_side = image_size // patch_size
         self.partial_rope = partial_rope
         self.dim = int(partial_rope * dim)
-        self.rope_scalling = PixtralRopeNoScalingImpl(self.dim, ratio, max_seq_len)
+        # NOTE: pixtral does not do rope scaling, so we delegate
+        # to the no scaling default value in the superclass.
 
         self.cached_freqs = {}
 
