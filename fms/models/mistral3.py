@@ -351,31 +351,6 @@ def _weight_fusion(
 serialization.register_adapter_step(_architecture_name, "weight_fusion", _weight_fusion)
 
 
-def _hf_gptq_mistral3_check(
-    input_sd: Mapping[str, Any], model_config: Optional[MistralConfig] = None, **kwargs
-) -> Mapping[str, Any]:
-    model_config = model_config.text_config  # type: ignore[union-attr]
-    has_fused_weights = True
-    linear_type = "torch_linear"
-    if model_config:
-        if not model_config.fused_weights:
-            has_fused_weights = False
-        if model_config.linear_config:
-            linear_type = model_config.linear_config["linear_type"]
-
-    if "gptq" in linear_type and has_fused_weights:
-        raise ValueError(
-            "GPTQ HF mistral3 checkpoints cannot be loaded into a model with fused weights"
-        )
-
-    return input_sd
-
-
-serialization.register_adapter_step(
-    _architecture_name, "hf_gptq_fusion_check", _hf_gptq_mistral3_check
-)
-
-
 def _hf_to_fms_names(input_sd: Mapping[str, Any], **kwargs) -> Mapping[str, Any]:
     replacements = replacements = [
         # Language Model
@@ -418,29 +393,25 @@ serialization.register_adapter_step(
 )
 
 
-def _get_rope_params(linear_type: str) -> list[str]:
-    if "gptq" in linear_type:
-        return ["qweight", "scales", "qzeros", "bias"]
-    else:  # torch.nn.Linear
-        return ["weight", "bias"]
-
-
 def _hf_to_fms_rope(
-    input_sd: Mapping[str, Any], model_config: Optional[MistralConfig] = None, **kwargs
+    input_sd: Mapping[str, Any], model_config: Optional[Mistral3Config] = None, **kwargs
 ) -> Mapping[str, Any]:
     new_sd = {}
-    model_config = model_config.text_config  # type: ignore[union-attr]
-    if model_config:
-        head_size = model_config.head_dim
-        linear_type = "torch_linear"
-        if model_config.linear_config:
-            linear_type = model_config.linear_config["linear_type"]
-    else:
-        logger.warning("Missing model_config, assuming defaults for head_size")
-        head_size = 128  # Good default for most models
-        linear_type = "torch_linear"
+    # TODO Validate that we can make this non optional; we should not try to
+    # infer this because the LLM and vision model will eventually be made
+    # generic, and also may have different head_dims.
+    assert model_config is not None
+    text_config = model_config.text_config
+    vision_config = model_config.vision_config
+    # TODO make this more generic, for now we avoid hard coding head dim
+    # in the pixtral config to prevent confusion, but we should set this
+    # on all model configs as a @property.
+    lm_head_dim = text_config.head_dim
+    vision_head_dim = vision_config.hidden_size // vision_config.nheads
 
-    rope_params = _get_rope_params(linear_type)
+    # TODO: Update this if we ever need gptq for this model arch,
+    # this assusmes torchj linear layers.
+    rope_params = ["weight", "bias"]
     # Match on either the language model or vision tower attn qk
     trans_required_pattern = re.compile(
         "|".join(
@@ -463,23 +434,17 @@ def _hf_to_fms_rope(
         # loading from an HF checkpoint, we need to undo the transformation
         # that HF does from the original Meta weights:
         if bool(trans_required_pattern.search(name)):
+            head_dim = lm_head_dim if "language" in name else vision_head_dim
             temp = param
-            if "gptq" in linear_type and temp.dim() == 2:
-                # GPTQ qweights are [in_feat, out_feat] (unlike usual [out_feat, in_feat])
-                # and are fully transposed before & after process
-                temp = temp.transpose(0, 1)
             # num_heads is used in the transformation required for hf->fms
             # can't be precomputed because q and k might have different num_heads
-            num_heads = temp.size(0) // head_size
+            num_heads = temp.size(0) // head_dim
 
             if temp.dim() == 2:  # weight
                 temp_view = temp.view(num_heads, 2, -1, temp.size(1))
             else:  # bias
                 temp_view = temp.view(num_heads, 2, -1)
             temp = temp_view.transpose(1, 2).reshape(*temp.size())
-
-            if "gptq" in linear_type and temp.dim() == 2:
-                temp = temp.transpose(0, 1)
 
             new_sd[name] = temp
         else:
@@ -495,5 +460,5 @@ serialization.register_adapter_step(
 serialization.register_adapter(
     _architecture_name,
     "hf",
-    ["hf_to_fms_names", "hf_to_fms_rope", "hf_gptq_fusion_check", "weight_fusion"],
+    ["hf_to_fms_names", "hf_to_fms_rope", "weight_fusion"],
 )
