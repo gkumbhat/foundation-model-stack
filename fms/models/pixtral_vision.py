@@ -100,6 +100,7 @@ class PixtralAttentionLayer(nn.Module):
             hidden_grow_factor=mlp_grow_factor,
             activation_fn=str_to_activation(self.config.hidden_act),
             use_bias=False,
+            p_dropout=0,
             fused=self.config.fused_weights,
             linear_config=self.config.linear_config,
         )
@@ -212,15 +213,11 @@ class PixtralVisionModel(nn.Module):
     def forward(
         self,
         pixel_values: torch.Tensor,
-        image_sizes: torch.Tensor | list[tuple[int, int]] | None = None,
+        image_sizes: torch.Tensor | list[tuple[int, int]],
         output_hidden_states=False,
         position_ids=None,
         **attn_kwargs: Unpack[AttentionKwargs],
     ):
-        # Standardize inputs & dtype
-        if image_sizes is None:
-            batch_size, _, height, width = pixel_values.shape
-            image_sizes = [(height, width)] * batch_size
         pixel_values = pixel_values.to(dtype=self.patch_conv.weight.dtype)
 
         # Pass images through initial convolution independently + flatten
