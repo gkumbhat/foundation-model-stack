@@ -219,6 +219,11 @@ class Mistral3(nn.Module):
 
         # Only consider image features at decode time
         if iteration == 0 and pixel_values is not None:
+            # Standardize inputs & dtype
+            if image_sizes is None:
+                batch_size, _, height, width = pixel_values.shape
+                image_sizes = [(height, width)] * batch_size
+
             img_features = self._get_image_features(pixel_values, image_sizes)
             embeds = self._merge_multimodal_embeddings(
                 input_ids,
