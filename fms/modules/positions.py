@@ -418,8 +418,8 @@ class PixtralRotaryEmbedding(RotaryEmbedding):
 
         if alpha not in self.cached_freqs[dev_idx]:
             # Create position indices for height and width
-            h = torch.arange(self.max_patches_per_side)
-            w = torch.arange(self.max_patches_per_side)
+            h = torch.arange(self.max_patches_per_side, device=device)
+            w = torch.arange(self.max_patches_per_side, device=device)
 
             freqs = 1.0 / (
                 base
