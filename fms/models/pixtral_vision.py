@@ -19,15 +19,23 @@ from typing import Any, Unpack
 
 logger = logging.getLogger(__name__)
 
-# Ref: https://github.com/huggingface/transformers/blob/v5.0.0/src/transformers/models/pixtral/modeling_pixtral.py#L37
-def position_ids_in_meshgrid(patch_embeds_list, max_width):
+def get_positions_in_meshgrid(
+    patch_embeds_list: list[torch.Tensor],
+) -> torch.Tensor:
+    """Get the 2D coordinates for each patch.
+    
+    NOTE: Transformers collapses the position IDs to 1D and flattens
+    freqs; our implementation for Pixtral Rope is based on Mistral inference
+    since it aligns better with other rope implementations in FMS.
+    """
     positions = []
     for patch in patch_embeds_list:
         height, width = patch.shape[-2:]
         mesh = torch.meshgrid(torch.arange(height), torch.arange(width), indexing="ij")
-        h_grid, v_grid = torch.stack(mesh, dim=-1).reshape(-1, 2).chunk(2, -1)
-        ids = h_grid * max_width + v_grid
-        positions.append(ids[:, 0])
+        # IDs are 2D for pixtral Rope
+        pos_id = torch.stack(mesh, dim=-1).reshape(-1, 2)
+        positions.append(pos_id)
+
     return torch.cat(positions)
 
 @dataclass
@@ -108,7 +116,7 @@ class PixtralAttentionLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_ids=None,
+        position_ids: torch.Tensor,
         **attn_kwargs: Unpack[AttentionKwargs],
     ):
         residual = hidden_states
@@ -143,7 +151,7 @@ class PixtralTransformer(nn.Module):
     def forward(
         self,
         inputs_embeds,
-        position_ids=None,
+        position_ids: torch.Tensor,
         output_hidden_states=False,
         **attn_kwargs: Unpack[AttentionKwargs],
     ):
@@ -200,7 +208,7 @@ class PixtralVisionModel(nn.Module):
         head_dim = self.config.hidden_size // self.config.nheads
         self.patch_positional_embedding = PixtralRotaryEmbedding(
             dim=head_dim,
-            ratio=self.config.rope_theta,
+            theta=self.config.rope_theta,
             image_size=self.config.image_size,
             patch_size=self.config.patch_size,
         )
@@ -222,7 +230,9 @@ class PixtralVisionModel(nn.Module):
 
         # Pass images through initial convolution independently + flatten
         patch_embeds = self.patch_conv(pixel_values)
-        # TODO: Check / fix potential graph break in positional encoding
+        # TODO: Check / fix potential graph break; this just slices off extra stuff
+        # that is not divisible by the patch size, but may not be needed; doesn't
+        # seem to be present in Mistral Inference.
         patch_embeds_list = [
             embed[..., : (size[0] // self.patch_size), : (size[1] // self.patch_size)]
             for embed, size in zip(patch_embeds, image_sizes)
@@ -234,11 +244,12 @@ class PixtralVisionModel(nn.Module):
 
         patch_embeds = self.ln_pre(patch_embeds)
 
-        # 2D Rope positions for image patches; the positional emb module
-        # expects this to be 2D, so we unsqueeze it for batch dim.
-        position_ids = position_ids_in_meshgrid(
-            patch_embeds_list, max_width=self.config.image_size // self.config.patch_size
-        ).unsqueeze(0)
+        # Similar to the Mistral Commons implementation of Pixtral,
+        # we keep the position IDs 2D since it's a bit easier to read
+        # for the interleaved implementation of RoPE.
+        position_ids = get_positions_in_meshgrid(
+            patch_embeds_list,
+        )
 
         # Invoke the actual transformer
         return self.transformer(
