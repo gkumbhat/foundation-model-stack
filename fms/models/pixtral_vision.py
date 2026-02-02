@@ -147,20 +147,20 @@ class PixtralTransformer(nn.Module):
         output_hidden_states=False,
         **attn_kwargs: Unpack[AttentionKwargs],
     ):
+        hidden_states = inputs_embeds
         # TODO: Currently aligns with siglip to return an empty tuple
         # when there are no hidden states, but None would make more sense
         # here and better align with HF Transformers for readability.
-        encoder_states = ()
+        encoder_states = (hidden_states,) if output_hidden_states else ()
 
-        hidden_states = inputs_embeds
         for encoder_layer in self.layers:
-            if output_hidden_states:
-                encoder_states = encoder_states + (hidden_states,)
             hidden_states = encoder_layer(
                 hidden_states=hidden_states,
                 position_ids=position_ids,
                 **attn_kwargs,
             )
+            if output_hidden_states:
+                encoder_states = encoder_states + (hidden_states,)
 
         return hidden_states, encoder_states
 
