@@ -1,6 +1,7 @@
 import math
 import unittest
 
+import pytest
 import torch
 
 from fms.modules.positions import RotaryEmbedding, PixtralRotaryEmbedding
@@ -255,18 +256,46 @@ class PixtralRotaryEmbeddingTest(unittest.TestCase):
         q = torch.randn(batch_size, patch_size, num_heads, dim)
         k = torch.randn(batch_size, patch_size, num_heads, dim)
 
-        # Apply pixtral rotary embeddings
-        q_rot, k_rot = rope.adjusted_qk(q, k)
+        # Test with explicit position_ids
+        height = patch_size
+        width = patch_size
+        # Create a sample grid; this is similar to get_positions_in_meshgrid for pixtral
+        mesh = torch.meshgrid(torch.arange(height), torch.arange(width), indexing="ij")
+        patch_pod_ids = torch.stack(mesh, dim=-1).reshape(-1, 2)
+        # Expand the batch dim
+        position_ids = patch_pod_ids.unsqueeze(0).repeat(batch_size, 1, 1)
+
+        q_rot, k_rot = rope.adjusted_qk(q, k, position_ids=position_ids)
 
         assert q_rot.shape == q.shape
         assert k_rot.shape == k.shape
 
-        # Test with explicit position_ids - this should not throw
-        position_ids = torch.arange(patch_size).unsqueeze(0).expand(batch_size, -1)
-        q_rot2, k_rot2 = rope.adjusted_qk(q, k, position_ids=position_ids)
+    def test_requires_positions(self):
+        """ensure that pixtral rope requires position IDs for 2D encoding."""
+        # Configuration
+        dim = 16
+        ratio = 10_000.0
+        image_size = 16
+        patch_size = 4
+        batch_size = 2
+        num_heads = 2
 
-        assert q_rot2.shape == q.shape
-        assert k_rot2.shape == k.shape
+        rope = PixtralRotaryEmbedding(dim, ratio, image_size, patch_size)
+
+        self.assertEqual(rope.dim, dim)
+        self.assertEqual(rope.max_patches_per_side, image_size // patch_size)
+
+        # Create dummy query and key tensors
+        q = torch.randn(batch_size, patch_size, num_heads, dim)
+        k = torch.randn(batch_size, patch_size, num_heads, dim)
+
+        # Test with explicit position_ids; this is allowed by the
+        # position encoder superclass, but not for pixtral since
+        # we need to know the grid layout (i.e., n x m and m x n
+        # will have different positional encodings when n and m are
+        # different).
+        with pytest.raises(ValueError):
+            rope.adjusted_qk(q, k, position_ids=None)
 
     def test_rope_at_position_0(self):
         """position (0,0) should have no rotation"""
@@ -311,7 +340,7 @@ class PixtralRotaryEmbeddingTest(unittest.TestCase):
                 position_ids_in_meshgrid as hf_position_ids_in_meshgrid,
             )
         except ImportError:
-            self.skipTest("transformers not installed or pixtral not available")
+            self.skipTest("Unable to import Transformer's Pixtral Model / Config")
 
         from fms.models.pixtral_vision import (
             get_positions_in_meshgrid as fms_get_positions_in_meshgrid,
