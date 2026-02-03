@@ -23,7 +23,7 @@ def get_positions_in_meshgrid(
     patch_embeds_list: list[torch.Tensor],
 ) -> torch.Tensor:
     """Get the 2D coordinates for each patch.
-    
+
     NOTE: Transformers collapses the position IDs to 1D and flattens
     freqs; our implementation for Pixtral Rope is based on Mistral inference
     since it aligns better with other rope implementations in FMS.
@@ -36,7 +36,8 @@ def get_positions_in_meshgrid(
         pos_id = torch.stack(mesh, dim=-1).reshape(-1, 2)
         positions.append(pos_id)
 
-    return torch.cat(positions)
+    # Add batch dimension to match patch_embeds shape
+    return torch.cat(positions).unsqueeze(0)
 
 @dataclass
 class PixtralVisionConfig(ModelConfig):

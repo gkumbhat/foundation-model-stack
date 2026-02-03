@@ -402,8 +402,8 @@ class PixtralRotaryEmbedding(PositionEncoder):
         image patches using 2D positional IDs. If the rotation matrices
         have already been computed for this device index, the cached
         results are returned.
-        
-        
+
+
         Args:
             device: device to compute frequencies on
         """
@@ -456,7 +456,7 @@ class PixtralRotaryEmbedding(PositionEncoder):
         q: torch.Tensor,
         k: torch.Tensor,
         position_ids: Optional[torch.LongTensor]=None,
-        past_kv_state: Optional[Tuple[torch.Tensor | None, torch.Tensor | None]]=None, 
+        past_kv_state: Optional[Tuple[torch.Tensor | None, torch.Tensor | None]]=None,
         use_cache=False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -464,7 +464,7 @@ class PixtralRotaryEmbedding(PositionEncoder):
         NOTE: as this is only used by Pixtral (vision encoder), we do not
         need to consider caching related args/kwargs, because it will only
         be used at prefill time.
-        
+
         Args
         ----
         q : torch.Tensor
@@ -494,13 +494,9 @@ class PixtralRotaryEmbedding(PositionEncoder):
         k_ = k.float().view(*k.size()[:-1], -1, 2)  # [B, L, H, D/2, 2]
 
         # Positionally encode the 2D positional IDs.
-        # seq_len = position_ids.shape[0]
+        # position_ids has shape [B, L, 2] with batch dimension included
         self.compute_freqs_cis(q.device)
-        freqs = self.cached_freqs[q.device.index][position_ids[:, 0], position_ids[:, 1]]
-        # The 2D positions already stack multiple images, and doing
-        # the above index will index the batch dimension out. Add it back.
-        freqs = freqs.unsqueeze(0)
-        # 2D index
+        freqs = self.cached_freqs[q.device.index][position_ids[:, :, 0], position_ids[:, :, 1]]
 
         freqs = freqs.float()  # [B, L, D/2, 2, 2]
 
@@ -530,11 +526,12 @@ class PixtralRotaryEmbedding(PositionEncoder):
         k_ = torch.view_as_complex(k.float().reshape(*k.shape[:-1], -1, 2))
 
         self.compute_freqs_cis(q.device)
-        freqs_cis = self.complex_freqs[q.device.index][position_ids[:, 0], position_ids[:, 1]]
-        freqs_cis = freqs_cis[:, None, :] # [L, 1, 32]
+        # position_ids has shape [B, L, 2] with batch dimension included
+        freqs_cis = self.complex_freqs[q.device.index][position_ids[:, :, 0], position_ids[:, :, 1]]
+        freqs_cis = freqs_cis[:, :, None, :] # [B, L, 1, D/2]
 
         # View as real is [B, L, N, D/2, 2], so flattening here
-        # creates the [B, L, N, D/2] output.
+         # creates the [B, L, N, D/2] output.
         q_out = torch.view_as_real(q_ * freqs_cis).flatten(3).type_as(q)
         k_out = torch.view_as_real(k_ * freqs_cis).flatten(3).type_as(k)
         return q_out, k_out

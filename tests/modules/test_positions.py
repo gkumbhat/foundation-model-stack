@@ -284,10 +284,9 @@ class PixtralRotaryEmbeddingTest(unittest.TestCase):
         q = torch.randn(batch_size, patch_size, num_heads, dim)
         k = torch.randn(batch_size, patch_size, num_heads, dim)
 
-        # For 1st pair
-        position_ids = torch.arange(
-            0, q.size(1), device=q.device, dtype=torch.long
-        ).unsqueeze(0)
+        # Create 2D position_ids with batch dimension: [batch_size, seq_len, 2]
+        # Position (0,0) means both height and width coordinates are 0
+        position_ids = torch.zeros(batch_size, patch_size, 2, dtype=torch.long)
 
         # Apply pixtral rotary embeddings
         q_rot, _ = rope.adjusted_qk(q, k, position_ids=position_ids)
