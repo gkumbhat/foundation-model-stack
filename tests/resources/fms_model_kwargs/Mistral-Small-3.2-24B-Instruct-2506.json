@@ -30,7 +30,6 @@
     "vision_config": {
         "attention_dropout": 0.0,
         "fused_weights": true,
-        "head_dim": 64,
         "hidden_act": "silu",
         "hidden_size": 1024,
         "image_size": 1540,
