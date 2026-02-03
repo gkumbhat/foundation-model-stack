@@ -298,3 +298,105 @@ class PixtralRotaryEmbeddingTest(unittest.TestCase):
             rtol=1e-6,
             msg="Position (0,0) should have no rotation",
         )
+
+    def test_hf_fms_equivalence(self):
+        """Test that FMS Pixtral RoPE matches HF Transformers implementation"""
+        try:
+            from transformers.models.pixtral.configuration_pixtral import (
+                PixtralVisionConfig,
+            )
+            from transformers.models.pixtral.modeling_pixtral import (
+                PixtralRotaryEmbedding as TransformersPixtralEmb,
+                apply_rotary_pos_emb,
+                position_ids_in_meshgrid as hf_position_ids_in_meshgrid,
+            )
+        except ImportError:
+            self.skipTest("transformers not installed or pixtral not available")
+
+        from fms.models.pixtral_vision import (
+            get_positions_in_meshgrid as fms_get_positions_in_meshgrid,
+        )
+
+        # Configuration
+        dim = 64
+        ratio = 10_000.0
+        image_size = 1024
+        patch_size = 16
+        batch_size = 1
+        num_heads = 16
+        patch_h, patch_w = 2, 3
+        num_patches = patch_h * patch_w
+
+        # Create sample inputs
+        query_proj = torch.ones(
+            batch_size, num_heads, num_patches, dim, dtype=torch.float32
+        )
+        key_proj = torch.ones(
+            batch_size, num_heads, num_patches, dim, dtype=torch.float32
+        )
+
+        # HF position_ids (1D flattened)
+        position_ids_hf = hf_position_ids_in_meshgrid(
+            patch_embeds_list=[torch.rand((1024, patch_h, patch_w))],
+            max_width=image_size // patch_size,
+        )
+
+        # FMS position_ids (2D with batch dimension)
+        position_ids_fms = fms_get_positions_in_meshgrid(
+            patch_embeds_list=[torch.rand((1024, patch_h, patch_w))],
+        )
+
+        ############ Get HF results
+        hf_config = PixtralVisionConfig(
+            **{
+                "hidden_size": 1024,
+                "head_dim": dim,
+                "rope_theta": ratio,
+                "image_size": image_size,
+                "patch_size": patch_size,
+            }
+        )
+        transformers_emb = TransformersPixtralEmb(hf_config)
+        cos, sin = transformers_emb(query_proj, position_ids_hf)
+        query_hf, key_hf = apply_rotary_pos_emb(
+            query_proj, key_proj, cos, sin, unsqueeze_dim=0
+        )
+
+        ############ Get FMS results
+        fms_emb = PixtralRotaryEmbedding(dim, ratio, image_size, patch_size)
+
+        # In FMS, the query and key are viewed as [1, 1064, 16, 64], i.e,.
+        # [bsz, num_patches, num_heads, head_dim] prior to invoking the rotational
+        # embeddings, so we need to permute the inputs.
+        query_fms_format = query_proj.transpose(1, 2)
+        key_fms_format = key_proj.transpose(1, 2)
+
+        query_fms, key_fms = fms_emb.adjusted_qk(
+            query_fms_format, key_fms_format, position_ids_fms
+        )
+
+        # Convert FMS format back to HF format
+        def permute_fms_to_hf(tensor):
+            """
+            Permute tensor from FMS RoPE format to HF RoPE format.
+            FMS: [x0, y0, x1, y1, x2, y2, ..., x15, y15] (interleaved pairs)
+            HF: [x0, x1, x2, ..., x15, y0, y1, y2, ..., y15] (split halves)
+            """
+            # [B, L, H, D/2]
+            *batch_dims, head_dim = tensor.shape
+            half_dim = head_dim // 2
+            # Reshape to separate interleaved pairs
+            paired = tensor.reshape(*batch_dims, half_dim, 2)
+            # Split into first and second elements of each pair
+            first_half = paired[..., 0]  # x0, x1, x2, ..., x15
+            second_half = paired[..., 1]  # y0, y1, y2, ..., y15
+
+            # Concatenate: first all x's, then all y's
+            return torch.cat([first_half, second_half], dim=-1)
+
+        adjusted_query_fms = permute_fms_to_hf(query_fms.transpose(1, 2))
+        adjusted_key_fms = permute_fms_to_hf(key_fms.transpose(1, 2))
+
+        # Compare results
+        torch.testing.assert_close(adjusted_query_fms, query_hf, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(adjusted_key_fms, key_hf, rtol=1e-4, atol=1e-5)
