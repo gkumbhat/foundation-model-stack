@@ -31,8 +31,9 @@ class Mistral3Config(ModelConfig):
     """
     Composite configuration for the FMS Mistral3 multimodal model.
 
-    This wraps a Mistral (text) config for Mistral3 - Pixtral is not added yet.
-    Fields default to the standard HF Mistral3 settings unless overridden.
+    This wraps a Mistral (text) config for Mistral3 & Pixtral vision encoder.
+    The current defaults correspond to Mistral3.2 24B, i.e.,
+    https://huggingface.co/mistralai/Mistral-Small-3.2-24B-Instruct-2506
     """
 
     text_config: MistralConfig = field(default_factory=MistralConfig)
@@ -198,10 +199,12 @@ class Mistral3(nn.Module):
 
     def reset_parameters(self):
         self.language_model.reset_parameters()
+        self.vision_tower.reset_parameters()
 
     def post_init(self):
         # Language model post init will handle head tying etc.
         self.language_model.post_init()
+        self.vision_tower.post_init()
 
     def prepare_inputs_for_generation(
         self,
@@ -248,7 +251,7 @@ class Mistral3(nn.Module):
     def _get_image_features(
         self,
         pixel_values: torch.Tensor,
-        image_sizes: torch.Tensor | None,
+        image_sizes: list[tuple[int, int]],
     ):
         # NOTE: 2 response values since unlike siglip/clip, we have no pooler;
         # we should refactor this to be wrapped in a class so that we can use
@@ -408,11 +411,17 @@ def _hf_to_fms_rope(
     assert model_config is not None
     text_config = model_config.text_config
     vision_config = model_config.vision_config
-    # TODO make this more generic, for now we avoid hard coding head dim
-    # in the pixtral config to prevent confusion, but we should set this
-    # on all model configs as a @property.
-    lm_head_dim = text_config.head_dim
-    vision_head_dim = vision_config.hidden_size // vision_config.nheads
+
+    if model_config is None:
+        # It Fall back to values for Mistral3.2; ModelConfig should really not be
+        # optional here though, as setting the wrong head dimensions can cause a
+        # lot of confusion.
+        lm_head_dim = 128
+        vision_head_dim = 64
+        logger.warning("Missing model_config, assuming default text/vision head sizes")
+    else:
+        lm_head_dim = text_config.head_dim
+        vision_head_dim = vision_config.hidden_size // vision_config.nheads
 
     # TODO: Update this if we ever need gptq for this model arch,
     # this assusmes torchj linear layers.

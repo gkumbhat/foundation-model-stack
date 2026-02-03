@@ -1,3 +1,4 @@
+import math
 import logging
 from dataclasses import dataclass
 
@@ -19,6 +20,7 @@ from typing import Any, Unpack
 
 logger = logging.getLogger(__name__)
 
+
 def get_positions_in_meshgrid(
     patch_embeds_list: list[torch.Tensor],
 ) -> torch.Tensor:
@@ -38,6 +40,7 @@ def get_positions_in_meshgrid(
 
     # Add batch dimension to match patch_embeds shape
     return torch.cat(positions).unsqueeze(0)
+
 
 @dataclass
 class PixtralVisionConfig(ModelConfig):
@@ -61,7 +64,9 @@ class PixtralVisionConfig(ModelConfig):
 
 
 class PixtralRMSNorm(LayerNormParameterized):
-    """Pixtral's RMS Norm using the FMS implementation of LayerNorm."""
+    """Pixtral's RMS Norm using the FMS implementation of LayerNorm.
+    Note that LayerNormParameterized implements parameter reset.
+    """
 
     def __init__(self, normalized_shape: int, eps: float):
         super().__init__(
@@ -138,7 +143,8 @@ class PixtralAttentionLayer(nn.Module):
 
     def reset_parameters(self):
         for m in self.modules():
-            m.reset_parameters()
+            if hasattr(m, "reset_parameters") and callable(m.reset_parameters):
+                m.reset_parameters()
 
 
 class PixtralTransformer(nn.Module):
@@ -175,7 +181,8 @@ class PixtralTransformer(nn.Module):
 
     def reset_parameters(self):
         for layer in self.layers:
-            layer.reset_parameters()
+            if hasattr(layer, "reset_parameters") and callable(layer.reset_parameters):
+                layer.reset_parameters()
 
 
 class PixtralVisionModel(nn.Module):
@@ -231,9 +238,8 @@ class PixtralVisionModel(nn.Module):
 
         # Pass images through initial convolution independently + flatten
         patch_embeds = self.patch_conv(pixel_values)
-        # TODO: Check / fix potential graph break; this just slices off extra stuff
-        # that is not divisible by the patch size, but may not be needed; doesn't
-        # seem to be present in Mistral Inference.
+
+        # Force divisibility by patch size
         patch_embeds_list = [
             embed[..., : (size[0] // self.patch_size), : (size[1] // self.patch_size)]
             for embed, size in zip(patch_embeds, image_sizes)
@@ -260,8 +266,48 @@ class PixtralVisionModel(nn.Module):
             **attn_kwargs,
         )
 
+    def _clean_up_rot_emb_cache(
+        self,
+        cached_freqs: dict[int, torch.Tensor],
+    ):
+        # Ensure that are no cached freqs on meta device for any reason
+        for dev in list(cached_freqs.keys()):
+            if cached_freqs[dev].device == torch.device("meta"):
+                del cached_freqs[dev]
+
+    def post_init(self):
+        # This function is called in `get_model` after the model is
+        # fully initalized on the correct device
+        self._clean_up_rot_emb_cache(
+            self.patch_positional_embedding.cached_freqs,
+        )
+
+        # init RoPE on the right device(s)
+        for device in set(
+            [param.device for param in self.parameters()]
+            + [buffer.device for buffer in self.buffers()]
+        ):
+            self.patch_positional_embedding.compute_freqs_cis(device)
+
     def reset_parameters(self):
+        # Conv2D - use lecun_normal with no bias, copied from FMS siglip
+        tensor = self.patch_conv.weight
+        fan_in, fan_out = nn.init._calculate_fan_in_and_fan_out(tensor)
+        variance = 1.0 / fan_in
+        nn.init.trunc_normal_(tensor, std=math.sqrt(variance))
+
+        if self.patch_conv.bias:
+            nn.init.zeros_(self.patch_conv.bias)
+
+        self.ln_pre.reset_parameters()
         self.transformer.reset_parameters()
+
+        # Reinitialize the 2D RoPE
+        for device in set(
+            [param.device for param in self.parameters()]
+            + [buffer.device for buffer in self.buffers()]
+        ):
+            self.patch_positional_embedding.compute_freqs_cis(device)
 
 
 # NOTE: We do not currently offer support for Pixtral as a standalone
