@@ -22,7 +22,9 @@ class PositionEncoder:
     ) -> Optional[torch.Tensor]:
         return mask
 
-    # Override to adjust q/k's e.g. for rotary embeddings
+    # Override to adjust q/k's e.g. for rotary embeddings. Note that some
+    # implementations may not use cache related kwargs, e.g., pixtral's 2D
+    # rope for images, which will not have a past kv states.
     def adjusted_qk(
         self,
         q: torch.Tensor,
@@ -364,23 +366,20 @@ class RotaryEmbedding(PositionEncoder):
             k_out = k_out.view_as(k_rope)
         return q_out, k_out
 
+
 class PixtralRotaryEmbedding(PositionEncoder):
     def __init__(
         self,
-        dim,
-        theta,
-        image_size,
-        patch_size,
+        dim: int,
+        theta: float,
+        image_size: int,
+        patch_size: int,
     ):
         """
         This implements PixtralRotaryEmbedding, which handles frequency
-        for each pixel positions The key difference from standard RoPe is that
-        the frequencies are pre-computed for a 2D grid of image patches with height x width patches.
-
-        Each image patch gets a positional embedding based on its 2D position matrix, which
-        is then flattened to 1D for attention.
-
-        Ref: https://github.com/huggingface/transformers/blob/76ee621a09cf0716718f0e8912a981d1b29f56be/src/transformers/models/pixtral/modeling_pixtral.py#L48
+        for each pixel positions The key difference from standard RoPe is
+        that the frequencies are pre-computed for a 2D grid of maximal
+        height x width patches.
         """
 
         super().__init__()
@@ -390,30 +389,33 @@ class PixtralRotaryEmbedding(PositionEncoder):
         # NOTE: pixtral does not do rope scaling, i.e., alpha is always 1.
         # For simplicity and to keep the implementation readable, we just
         # map the device index to the freqs directly.
-        self.cached_freqs = {}
-        # NOTE: Complex freqs are the equivalent using polar coordinates and
-        # complex numbers; currently (for testing only) we compute both to
-        # check correctness.
-        self.complex_freqs = {}
+        self.cached_freqs: dict[int, torch.Tensor] = {}
 
-    def compute_freqs_cis(self, device) -> torch.Tensor:
+    def compute_freqs_cis(self, device: torch.device) -> torch.Tensor:
         """
         Computes the rotational transforms for Pixtral, which encodes
         image patches using 2D positional IDs. If the rotation matrices
         have already been computed for this device index, the cached
         results are returned.
 
+        NOTE: This implementation is similar in implementation to that in
+        mistral inference (see link below) without complex numbers. This is
+        easier to compare to for numeric correctness than the HF implementation
+        because it uses the same weight permutation for interleave RoPE rather
+        than permuting the weights to use rotate half.
+
+        https://github.com/mistralai/mistral-inference/blob/v1.6.0/src/mistral_inference/rope.py
 
         Args:
             device: device to compute frequencies on
         """
-        assert device != torch.device("meta")
-        dev_idx = device.index
+        if device == torch.device("meta"):
+            raise AssertionError("Attempted to init pixtral freqs on meta device")
 
-        if dev_idx not in self.cached_freqs:
-            self.cached_freqs[dev_idx] = {}
-
-        freqs = 1.0 / (self.theta ** (torch.arange(0, self.dim, 2, device=device).float() / self.dim))
+        freqs = 1.0 / (
+            self.theta
+            ** (torch.arange(0, self.dim, 2, device=device).float() / self.dim)
+        )
 
         # Create position indices for height and width
         h = torch.arange(self.max_patches_per_side, device=device)
@@ -433,7 +435,7 @@ class PixtralRotaryEmbedding(PositionEncoder):
             dim=-1,
         )
 
-        # max, max, dim, 4
+        # [max_size, max_size, dim, 4]
         rot_matrices = torch.stack(
             [
                 torch.cos(freqs_2d),
@@ -443,21 +445,18 @@ class PixtralRotaryEmbedding(PositionEncoder):
             ],
             dim=-1,
         )
-        # NOTE: For testing only to compare real / complex implementations
-        # self.complex_freqs[dev_idx] = torch.polar(torch.ones_like(freqs_2d), freqs_2d)
-
-        # Create the 2x2 rotation matrices -> max, max, dim, 2, 2
+        # Create the 2x2 rotation matrices -> [max_size, max_size, dim, 2, 2]
         rot_matrices = rot_matrices.view(*freqs_2d.size(), 2, 2)
-        self.cached_freqs[dev_idx] = rot_matrices
+        self.cached_freqs[device.index] = rot_matrices
         return rot_matrices
 
     def adjusted_qk(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
-        position_ids: Optional[torch.LongTensor]=None,
-        past_kv_state: Optional[Tuple[torch.Tensor | None, torch.Tensor | None]]=None,
-        use_cache=False,
+        position_ids: Optional[torch.LongTensor],
+        *args,
+        **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         This function applies 2D rotary embeddings to the queries and keys.
@@ -474,29 +473,18 @@ class PixtralRotaryEmbedding(PositionEncoder):
         position_ids : torch.LongTensor
             2D positional IDs (patch coordinates).
         """
-        if position_ids is None:
-            raise ValueError("Position IDs must be passed for pixtral RoPE.")
+        if position_ids is None or position_ids.ndim < 2 or position_ids.shape[-1] != 2:
+            raise ValueError("Position IDs for Pixtral must be 2D (H, W) coordinates.")
 
-        q_real_out, k_real_out = self._compute_adjust_qk_with_real(q, k, position_ids)
-        # q_complex_out, k_complex_out = self._compute_adjust_qk_with_complex(q, k, position_ids)
-        return q_real_out, k_real_out
-
-    def _compute_adjust_qk_with_real(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        position_ids: Optional[torch.LongTensor]=None,
-    ):
-        """Implements qk adjustment with real numbers (rotation matrices). The results
-        should be identical to the complex implementation.
-        """
         q_ = q.float().view(*q.size()[:-1], -1, 2)  # [B, L, H, D/2, 2]
         k_ = k.float().view(*k.size()[:-1], -1, 2)  # [B, L, H, D/2, 2]
 
         # Positionally encode the 2D positional IDs.
         # position_ids has shape [B, L, 2] with batch dimension included
         self.compute_freqs_cis(q.device)
-        freqs = self.cached_freqs[q.device.index][position_ids[:, :, 0], position_ids[:, :, 1]]
+        freqs = self.cached_freqs[q.device.index][
+            position_ids[:, :, 0], position_ids[:, :, 1]
+        ]
 
         freqs = freqs.float()  # [B, L, D/2, 2, 2]
 
@@ -507,31 +495,6 @@ class PixtralRotaryEmbedding(PositionEncoder):
 
         # Sum the last dimension out, creating a [B, L, N, D/2, 2], then flatten
         # the (new) 3rd dimension to create the [B, L, N, D] output.
-
         q_out = mulq.sum(5).flatten(3).type_as(q)
         k_out = mulk.sum(5).flatten(3).type_as(k)
-        return q_out, k_out
-
-
-    def _compute_adjust_qk_with_complex(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        position_ids: Optional[torch.LongTensor]=None,
-    ):
-        """Implements qk adjustment with polar coordinates. Derived from mistral commons,
-        with the primary difference being the batch dimension."""
-        # [B, L, N, D/2]
-        q_ = torch.view_as_complex(q.float().reshape(*q.shape[:-1], -1, 2))
-        k_ = torch.view_as_complex(k.float().reshape(*k.shape[:-1], -1, 2))
-
-        self.compute_freqs_cis(q.device)
-        # position_ids has shape [B, L, 2] with batch dimension included
-        freqs_cis = self.complex_freqs[q.device.index][position_ids[:, :, 0], position_ids[:, :, 1]]
-        freqs_cis = freqs_cis[:, :, None, :] # [B, L, 1, D/2]
-
-        # View as real is [B, L, N, D/2, 2], so flattening here
-         # creates the [B, L, N, D/2] output.
-        q_out = torch.view_as_real(q_ * freqs_cis).flatten(3).type_as(q)
-        k_out = torch.view_as_real(k_ * freqs_cis).flatten(3).type_as(k)
         return q_out, k_out
