@@ -341,7 +341,6 @@ def build_mistral3_params(config: PretrainedConfig) -> dict:
     text_config_params = build_mistral_params(config.text_config)
     config_params["text_config"] = MistralConfig(**text_config_params)
 
-    # TODO - add param builder for pixtral
     vision_config_params = build_pixtral_params(config.vision_config)
     config_params["vision_config"] = PixtralVisionConfig(**vision_config_params)
     return config_params

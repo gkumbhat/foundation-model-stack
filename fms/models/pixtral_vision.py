@@ -275,6 +275,13 @@ class PixtralVisionModel(nn.Module):
             if cached_freqs[dev].device == torch.device("meta"):
                 del cached_freqs[dev]
 
+    @classmethod
+    def from_config(cls, config: PixtralVisionConfig) -> "PixtralVisionModel":
+        return cls(config)
+
+    def get_config(self) -> PixtralVisionConfig:
+        return self.config
+
     def post_init(self):
         # This function is called in `get_model` after the model is
         # fully initalized on the correct device

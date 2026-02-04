@@ -43,7 +43,6 @@ class Mistral3Config(ModelConfig):
     spatial_merge_size: int = 2
     image_token_index: int = 10
     vision_feature_layer: int | list[int] = -1
-    tie_heads: bool = False
     ### FMS Specific
     fused_weights: bool = True  # True For CPU/GPU = T, False for AIU
 
@@ -195,7 +194,7 @@ class Mistral3(nn.Module):
         return cls(config)
 
     def get_config(self) -> ModelConfig:
-        return self.config.text_config
+        return self.config
 
     def reset_parameters(self):
         self.language_model.reset_parameters()
@@ -405,12 +404,6 @@ def _hf_to_fms_rope(
     input_sd: Mapping[str, Any], model_config: Optional[Mistral3Config] = None, **kwargs
 ) -> Mapping[str, Any]:
     new_sd = {}
-    # TODO Validate that we can make this non optional; we should not try to
-    # infer this because the LLM and vision model will eventually be made
-    # generic, and also may have different head_dims.
-    assert model_config is not None
-    text_config = model_config.text_config
-    vision_config = model_config.vision_config
 
     if model_config is None:
         # It Fall back to values for Mistral3.2; ModelConfig should really not be
@@ -420,6 +413,8 @@ def _hf_to_fms_rope(
         vision_head_dim = 64
         logger.warning("Missing model_config, assuming default text/vision head sizes")
     else:
+        text_config = model_config.text_config
+        vision_config = model_config.vision_config
         lm_head_dim = text_config.head_dim
         vision_head_dim = vision_config.hidden_size // vision_config.nheads
 

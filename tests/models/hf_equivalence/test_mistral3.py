@@ -30,9 +30,7 @@ def load_system_prompt(repo_id: str, filename: str) -> str:
     return system_prompt.format(name=model_name, today=today, yesterday=yesterday)
 
 
-
 def _get_inputs(processor, model_path, image_path="Battle.jpeg"):
-
     # Load system prompt else, error out to make sure we test with right system prompt
     system_prompt = load_system_prompt(model_path, "SYSTEM_PROMPT.txt")
     messages = [
@@ -61,7 +59,6 @@ def _get_inputs(processor, model_path, image_path="Battle.jpeg"):
 
 
 def _get_hf_model_output(model_path, inputs, max_new_tokens=100):
-
     model = AutoModelForImageTextToText.from_pretrained(model_path).to(device)
     model.eval()
     with torch.no_grad():
@@ -123,7 +120,6 @@ def test_mistral3_24b_equivalence():
 
     hf_model_output = _get_hf_model_output(model_path, inputs)
     fms_model_output = _get_fms_model_output(model_path, inputs)
-
 
     print(processor.decode(fms_model_output, skip_special_tokens=True))
 
