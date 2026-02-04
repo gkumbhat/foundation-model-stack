@@ -1,19 +1,18 @@
+from datetime import datetime, timedelta
 import os
 import pytest
-from datetime import datetime, timedelta
-
 import torch
-from difflib import SequenceMatcher
 from huggingface_hub import hf_hub_download
 from PIL import Image
 from transformers import AutoProcessor
 from transformers import AutoModelForImageTextToText
+import requests
 
 from fms.models import get_model
 from fms.utils.generation import generate, pad_input_ids
 
-device = "cpu"
-torch.set_default_dtype(torch.float32)
+device = "cuda"
+torch.set_default_dtype(torch.bfloat16)
 
 
 def load_system_prompt(repo_id: str, filename: str) -> str:
@@ -21,7 +20,13 @@ def load_system_prompt(repo_id: str, filename: str) -> str:
 
     Ref: https://huggingface.co/mistralai/Mistral-Small-3.2-24B-Instruct-2506#transformers
     """
-    file_path = hf_hub_download(repo_id=repo_id, filename=filename)
+    # Try to grab the system prompt if it's local, otherwise download it
+    maybe_local_file = os.path.join(repo_id, filename)
+    if os.path.isfile(maybe_local_file):
+        file_path = maybe_local_file
+    else:
+        file_path = hf_hub_download(repo_id=repo_id, filename=filename)
+
     with open(file_path, "r") as file:
         system_prompt = file.read()
     today = datetime.today().strftime("%Y-%m-%d")
@@ -30,9 +35,12 @@ def load_system_prompt(repo_id: str, filename: str) -> str:
     return system_prompt.format(name=model_name, today=today, yesterday=yesterday)
 
 
-def _get_inputs(processor, model_path, image_path="Battle.jpeg"):
+def _get_inputs(processor, model_path):
     # Load system prompt else, error out to make sure we test with right system prompt
     system_prompt = load_system_prompt(model_path, "SYSTEM_PROMPT.txt")
+    url = "https://huggingface.co/datasets/patrickvonplaten/random_img/resolve/main/europe.png"
+    images = [Image.open(requests.get(url, stream=True).raw)]
+
     messages = [
         {"role": "system", "content": system_prompt},
         {
@@ -40,25 +48,23 @@ def _get_inputs(processor, model_path, image_path="Battle.jpeg"):
             "content": [
                 {
                     "type": "text",
-                    "text": "What action do you think I should take in this situation? List all the possible actions and explain why you think they are good or bad.",
+                    "text": "What is this? Answer in one sentence.",
                 },
                 {"type": "image"},
             ],
         },
     ]
-
-    # Load image
-    images = [Image.open(image_path)]
-
     # Apply chat template and process inputs
     text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
-    inputs = processor(text=text, images=images, return_tensors="pt").to(device)
+    inputs = processor(text=text, images=images, return_tensors="pt").to(
+        device, dtype=torch.bfloat16
+    )
     return inputs
 
 
-def _get_hf_model_output(model_path, inputs, max_new_tokens=100):
+def _get_hf_model_output(model_path, inputs, max_new_tokens=6):
     model = AutoModelForImageTextToText.from_pretrained(model_path).to(device)
     model.eval()
     with torch.no_grad():
@@ -68,11 +74,11 @@ def _get_hf_model_output(model_path, inputs, max_new_tokens=100):
     return output
 
 
-def _get_fms_model_output(model_path, inputs, max_new_tokens=100):
+def _get_fms_model_output(model_path, inputs, max_new_tokens=6):
     model = get_model(
         "hf_pretrained",
         model_path,
-        data_type=torch.float32,
+        data_type=torch.bfloat16,
         device_type=device,
     )
     model.eval()
@@ -104,16 +110,17 @@ def _get_fms_model_output(model_path, inputs, max_new_tokens=100):
 @pytest.mark.slow
 def test_mistral3_24b_equivalence():
     # for now, this test won't be run, but it has been verified
-    # if you would like to try this, set granite_model_path to the huggingface granite model path
-
-    # model_path = "/path/to/Mistral-Small-3.1-24B-Instruct-2503"
-    model_path = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
+    # if you would like to try this, set model_path to the HF model path
+    # for mistral 3.1
+    #
+    # Further, we use bf16 to allow this test to run on a single (large) GPU,
+    # e.g., h100. As such, we only check a very short sequence for equivalence
+    # in this test.
+    model_path = "/path/to/Mistral-Small-3.1-24B-Instruct-2503"
 
     # NOTE: Mistral 3.2 doesn't have the HF processor config in the checkpoint,
     # so we use the processor from Mistral 3.1 which is compatible
-    processor = AutoProcessor.from_pretrained(
-        "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
-    )
+    processor = AutoProcessor.from_pretrained(model_path)
 
     # Get inputs with the model path for system prompt loading
     inputs = _get_inputs(processor, model_path)
@@ -121,7 +128,8 @@ def test_mistral3_24b_equivalence():
     hf_model_output = _get_hf_model_output(model_path, inputs)
     fms_model_output = _get_fms_model_output(model_path, inputs)
 
-    print(processor.decode(fms_model_output, skip_special_tokens=True))
+    # Expected result: `This is a map of Europe`
+    torch.testing.assert_close(fms_model_output, hf_model_output)
 
 
 if __name__ == "__main__":
