@@ -2,10 +2,6 @@ from datetime import datetime, timedelta
 import os
 import pytest
 import torch
-from huggingface_hub import hf_hub_download
-from PIL import Image
-from transformers import AutoProcessor
-from transformers import AutoModelForImageTextToText
 import requests
 
 from fms.models import get_model
@@ -25,6 +21,8 @@ def load_system_prompt(repo_id: str, filename: str) -> str:
     if os.path.isfile(maybe_local_file):
         file_path = maybe_local_file
     else:
+        from huggingface_hub import hf_hub_download
+
         file_path = hf_hub_download(repo_id=repo_id, filename=filename)
 
     with open(file_path, "r") as file:
@@ -36,6 +34,8 @@ def load_system_prompt(repo_id: str, filename: str) -> str:
 
 
 def _get_inputs(processor, model_path):
+    from PIL import Image
+
     # Load system prompt else, error out to make sure we test with right system prompt
     system_prompt = load_system_prompt(model_path, "SYSTEM_PROMPT.txt")
     url = "https://huggingface.co/datasets/patrickvonplaten/random_img/resolve/main/europe.png"
@@ -65,6 +65,8 @@ def _get_inputs(processor, model_path):
 
 
 def _get_hf_model_output(model_path, inputs, max_new_tokens=6):
+    from transformers import AutoModelForImageTextToText
+
     model = AutoModelForImageTextToText.from_pretrained(model_path).to(device)
     model.eval()
     with torch.no_grad():
@@ -109,6 +111,8 @@ def _get_fms_model_output(model_path, inputs, max_new_tokens=6):
 
 @pytest.mark.slow
 def test_mistral3_24b_equivalence():
+    from transformers import AutoProcessor
+
     # for now, this test won't be run, but it has been verified
     # if you would like to try this, set model_path to the HF model path
     # for mistral 3.1
