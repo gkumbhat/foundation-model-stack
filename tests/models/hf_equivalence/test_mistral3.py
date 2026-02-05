@@ -8,7 +8,6 @@ from fms.models import get_model
 from fms.utils.generation import generate, pad_input_ids
 
 device = "cuda"
-torch.set_default_dtype(torch.bfloat16)
 
 
 def load_system_prompt(repo_id: str, filename: str) -> str:
@@ -67,7 +66,9 @@ def _get_inputs(processor, model_path):
 def _get_hf_model_output(model_path, inputs, max_new_tokens=6):
     from transformers import AutoModelForImageTextToText
 
-    model = AutoModelForImageTextToText.from_pretrained(model_path).to(device)
+    model = AutoModelForImageTextToText.from_pretrained(
+        model_path, torch_dtype=torch.bfloat16
+    ).to(device)
     model.eval()
     with torch.no_grad():
         output = model.generate(
