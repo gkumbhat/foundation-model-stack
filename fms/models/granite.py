@@ -30,31 +30,56 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class GraniteConfig(ModelConfig):
-    src_vocab_size: int = 32_000  # can be set by tokenizer
-    emb_dim: int = 4096
+    src_vocab_size: int = 100352  # can be set by tokenizer
+    emb_dim: int = 2560
     norm_eps: float = 1e-5
-    nheads: int = 32
-    head_dim: int = 128  # getattr(config, "head_dim", emb_dim // nheads)
-    kvheads: int = 0
-    nlayers: int = 32
-    pad_id: int = -1
-    hidden_grow_factor: float = 8 / 3
+    nheads: int = 40
+    head_dim: int = 64  # getattr(config, "head_dim", emb_dim // nheads)
+    kvheads: int = 8
+    nlayers: int = 40
+    pad_id: int = 100256
+    hidden_grow_factor: float = 8192/ 2560
     multiple_of: int = 256
     activation_fn: str = "swish"
     p_dropout: float = 0.0
-    max_expected_seq_len: int = 4096
+    max_expected_seq_len: int = 8192
     ntk_scaling: bool = False
     attn_bias: bool = False
     mlp_bias: bool = False
-    tie_heads: bool = False
+    tie_heads: bool = True
     rope_theta: float = 10_000.0
     embedding_multiplier: float = 1.0
     logits_scaling: float = 1.0
     residual_multiplier: float = 1.0
     attention_multiplier: float = 1.0
     linear_config: Optional[Mapping[str, Any]] = None
-    fused_weights: bool = True
+    fused_weights: bool = False
 
+
+class DimensionPadding(nn.Module):
+    """Pads embedding dimension to meet Spyre layout requirements"""
+    def __init__(self, original_dim: int, padded_dim: int):
+        super().__init__()
+        self.original_dim = original_dim
+        self.padded_dim = padded_dim
+        self.padding_size = padded_dim - original_dim
+
+    def pad(self, x: torch.Tensor) -> torch.Tensor:
+        """Pad last dimension from original_dim to padded_dim"""
+        if self.padding_size == 0:
+            return x
+        # x shape: [..., original_dim]
+        padding = torch.zeros(
+            *x.shape[:-1], self.padding_size,
+            dtype=x.dtype, device=x.device
+        )
+        return torch.cat([x, padding], dim=-1)
+
+    def unpad(self, x: torch.Tensor) -> torch.Tensor:
+        """Remove padding from last dimension"""
+        if self.padding_size == 0:
+            return x
+        return x[..., :self.original_dim]
 
 class GraniteBlock(nn.Module):
     def __init__(self, config: GraniteConfig, rotary_emb: RotaryEmbedding):
@@ -174,52 +199,146 @@ class GraniteHeadless(nn.Module):
         self.config = self.config.updated(**kwargs)
         self.distributed_strategy = distributed_strategy
 
+        # Store original dimension for weight loading
+        self.original_emb_dim = 2560
+        self.target_emb_dim = 4096
+        self.needs_padding = (self.original_emb_dim != self.target_emb_dim)
+
+        # Override config to use target dimension
+        if self.needs_padding:
+            print(f"⚠️  Model will use emb_dim={self.target_emb_dim} (padded from {self.original_emb_dim})")
+            self.config.emb_dim = self.target_emb_dim
+
         self.width = self.config.emb_dim
         self.pad_id = self.config.pad_id
         self.max_expected_seq_len = self.config.max_expected_seq_len
 
+        # Embedding with TARGET dimension (will be padded during load)
         self.embedding = nn.Embedding(
             self.config.src_vocab_size,
-            self.config.emb_dim,
+            self.config.emb_dim,  # Use target dimension
             padding_idx=self.config.pad_id,
         )
 
-        rope_scaling = {"rope_type": "ntk" if self.config.ntk_scaling else "regular"}
+        # ... rest of initialization remains the same ...
 
-        self.rot_emb = RotaryEmbedding(
-            dim=self.config.head_dim,
-            scaling=rope_scaling,
-            max_seq_len=self.config.max_expected_seq_len,
-            ratio=self.config.rope_theta,
-        )
-        # RoPE init
-        for device in set(
-            [param.device for param in self.parameters()]
-            + [buffer.device for buffer in self.buffers()]
-        ):
-            self.rot_emb.compute_freqs_cis(device, self.config.max_expected_seq_len)
+    def _pad_weight_tensor(self, tensor: torch.Tensor, dim: int) -> torch.Tensor:
+        """Pad a weight tensor along specified dimension from original to target size"""
+        if not self.needs_padding:
+            return tensor
 
-        layers = []
-        for i in range(self.config.nlayers):
-            block: nn.Module = GraniteBlock(self.config, self.rot_emb)
-            block = self.distributed_strategy.distribute_layer(block, i)
-            layers.append(block)
-        self.layers = nn.ModuleList(layers)
+        padding_size = self.target_emb_dim - self.original_emb_dim
 
-        dec_norm = LayerNormParameterized(
-            self.config.emb_dim,
-            elementwise_scale=True,
-            elementwise_shift=False,
-            use_mean=False,
-            eps=self.config.norm_eps,
-            use_high_precision_pow=True,
-        )
-        self.dec_norm = self.distributed_strategy.distribute_module(
-            dec_norm, final_layers=True
-        )
+        if dim == 0:  # Pad rows (output dimension)
+            padding = torch.zeros(
+                padding_size, *tensor.shape[1:],
+                dtype=tensor.dtype, device=tensor.device
+            )
+            return torch.cat([tensor, padding], dim=0)
+        elif dim == 1:  # Pad columns (input dimension)
+            padding = torch.zeros(
+                tensor.shape[0], padding_size, *tensor.shape[2:],
+                dtype=tensor.dtype, device=tensor.device
+            )
+            return torch.cat([tensor, padding], dim=1)
+        else:
+            raise ValueError(f"Unsupported padding dimension: {dim}")
 
+    def load_state_dict(self, state_dict, strict=True):
+        """Override to handle dimension padding during weight loading"""
+        if not self.needs_padding:
+            return super().load_state_dict(state_dict, strict=strict)
+
+        # Pad weights that need it
+        padded_state_dict = {}
+        for key, value in state_dict.items():
+            if 'embedding.weight' in key:
+                # Pad embedding: [vocab_size, original_dim] -> [vocab_size, target_dim]
+                padded_state_dict[key] = self._pad_weight_tensor(value, dim=1)
+                print(f"Padded {key}: {value.shape} -> {padded_state_dict[key].shape}")
+
+            elif any(x in key for x in ['attn.wq.weight', 'attn.wk.weight', 'attn.wv.weight']):
+                # Pad attention input: [head_dim * nheads, original_dim] -> [head_dim * nheads, target_dim]
+                padded_state_dict[key] = self._pad_weight_tensor(value, dim=1)
+                print(f"Padded {key}: {value.shape} -> {padded_state_dict[key].shape}")
+
+            elif 'attn.wo.weight' in key:
+                # Pad attention output: [original_dim, head_dim * nheads] -> [target_dim, head_dim * nheads]
+                padded_state_dict[key] = self._pad_weight_tensor(value, dim=0)
+                print(f"Padded {key}: {value.shape} -> {padded_state_dict[key].shape}")
+
+            elif any(x in key for x in ['ff_sub_layer', 'w1.weight', 'w2.weight', 'w3.weight']):
+                # Pad FFN weights
+                if 'w1.weight' in key or 'w3.weight' in key:
+                    # Input projection: [intermediate, original_dim] -> [intermediate, target_dim]
+                    padded_state_dict[key] = self._pad_weight_tensor(value, dim=1)
+                elif 'w2.weight' in key:
+                    # Output projection: [original_dim, intermediate] -> [target_dim, intermediate]
+                    padded_state_dict[key] = self._pad_weight_tensor(value, dim=0)
+                print(f"Padded {key}: {value.shape} -> {padded_state_dict[key].shape}")
+
+            elif any(x in key for x in ['ln.weight', 'ff_ln.weight', 'dec_norm.weight']):
+                # Pad layer norm: [original_dim] -> [target_dim]
+                padding = torch.ones(
+                    self.target_emb_dim - self.original_emb_dim,
+                    dtype=value.dtype, device=value.device
+                )
+                padded_state_dict[key] = torch.cat([value, padding], dim=0)
+                print(f"Padded {key}: {value.shape} -> {padded_state_dict[key].shape}")
+
+            else:
+                # No padding needed
+                padded_state_dict[key] = value
+
+        return super().load_state_dict(padded_state_dict, strict=strict)
+
+    def forward(
+        self,
+        x_in,
+        position_ids=None,
+        past_key_value_states=None,
+        use_cache=False,
+        **attn_kwargs: Unpack[AttentionKwargs],
+    ):
+        if past_key_value_states is None or len(past_key_value_states) == 0:
+            past_key_value_states = [None for _ in range(len(self.layers))]
+
+        if x_in.dim() == 2:  # input is not already embedded
+            x_in = self.embedding(x_in)  # Shape: [..., original_emb_dim]
+
+        # PAD EMBEDDINGS
+        if self.use_padding:
+            x_in = self.dim_padding.pad(x_in)  # Shape: [..., padded_emb_dim]
+
+        x_in = x_in * self.config.embedding_multiplier
+
+        present_key_value_states = []
+
+        for i, layer in enumerate(self.layers):
+            output = layer(
+                x=x_in,
+                position_ids=position_ids,
+                past_key_value_state=past_key_value_states[i],
+                use_cache=use_cache,
+                **attn_kwargs,
+            )
+
+            if use_cache:
+                x_in, present_key_value_state = output
+                present_key_value_states.append(present_key_value_state)
+            else:
+                x_in = output
+
+        dec_out = x_in
+        dec_out = self.dec_norm(dec_out)
         if self.config.p_dropout:
-            self.dropout = nn.Dropout(self.config.p_dropout)
+            dec_out = self.dropout(dec_out)
+
+        # UNPAD BEFORE RETURNING
+        if self.use_padding:
+            dec_out = self.dim_padding.unpad(dec_out)  # Shape: [..., original_emb_dim]
+
+        return dec_out, present_key_value_states
 
     def reset_parameters(self):
         nn.init.trunc_normal_(
@@ -272,50 +391,7 @@ class GraniteHeadless(nn.Module):
         ):
             self.rot_emb.compute_freqs_cis(device, self.config.max_expected_seq_len)
 
-    def forward(
-        self,
-        x_in,
-        position_ids=None,
-        past_key_value_states=None,
-        use_cache=False,
-        **attn_kwargs: Unpack[AttentionKwargs],
-    ):
-        # Embed the given vocabulary indices using the given attention mask, with pre-/post-norm and dropout as specified
-        # x_in: batch_size x seq_len x emb_dim if input is already embedded, otherwise batch_size x seq_len
-        # mask: batch_size x seq_len x seq_len
-        # bias: nheads x seq_len x seq_len
-        if past_key_value_states is None or len(past_key_value_states) == 0:
-            past_key_value_states = [None for _ in range(len(self.layers))]
 
-        if x_in.dim() == 2:  # input is not already embedded
-            x_in = self.embedding(x_in)
-        x_in = x_in * self.config.embedding_multiplier
-
-        # this is the output cache for all the decoder layers
-        present_key_value_states = []
-
-        for i, layer in enumerate(self.layers):
-            output = layer(
-                x=x_in,
-                position_ids=position_ids,
-                past_key_value_state=past_key_value_states[i],
-                use_cache=use_cache,
-                **attn_kwargs,
-            )
-
-            if use_cache:
-                x_in, present_key_value_state = output
-                present_key_value_states.append(present_key_value_state)
-
-            else:
-                x_in = output
-
-        dec_out = x_in
-        dec_out = self.dec_norm(dec_out)
-        if self.config.p_dropout:
-            dec_out = self.dropout(dec_out)
-
-        return dec_out, present_key_value_states
 
 
 class Granite(nn.Module):
@@ -331,12 +407,35 @@ class Granite(nn.Module):
         else:
             self.config = GraniteConfig()
         self.config = self.config.updated(**kwargs)
+
+        print("=================================")
+        print(self.config)
+        print("=================================")
         self.distributed_strategy = distributed_strategy
 
         self.base_model = GraniteHeadless(self.config, self.distributed_strategy)
+
+        # Head uses target dimension (same as base_model after padding)
         self.head = nn.Linear(
-            self.config.emb_dim, self.config.src_vocab_size, bias=False
+            self.base_model.config.emb_dim,  # Use padded dimension
+            self.config.src_vocab_size,
+            bias=False
         )
+
+    def load_state_dict(self, state_dict, strict=True):
+        """Override to handle head weight padding"""
+        if self.base_model.needs_padding:
+            padded_state_dict = {}
+            for key, value in state_dict.items():
+                if 'head.weight' in key:
+                    # Pad head: [vocab_size, original_dim] -> [vocab_size, target_dim]
+                    padded_state_dict[key] = self.base_model._pad_weight_tensor(value, dim=1)
+                    print(f"Padded {key}: {value.shape} -> {padded_state_dict[key].shape}")
+                else:
+                    padded_state_dict[key] = value
+            state_dict = padded_state_dict
+
+        return super().load_state_dict(state_dict, strict=strict)
 
     @classmethod
     def from_config(cls, config: GraniteConfig) -> "Granite":

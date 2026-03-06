@@ -130,7 +130,7 @@ def build_granite_moe_hybrid_params(config: PretrainedConfig) -> dict:
         "attn_bias": getattr(config, "attention_bias", False),
         "kvheads": config.num_key_value_heads,
         "norm_eps": config.rms_norm_eps,
-        "multiple_of": 1,
+        "multiple_of": 256,
         "emb_dim": config.hidden_size,
         "max_expected_seq_len": config.max_position_embeddings,
         "residual_multiplier": config.residual_multiplier,
@@ -142,6 +142,7 @@ def build_granite_moe_hybrid_params(config: PretrainedConfig) -> dict:
         "head_dim": getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
         ),
+        "fused_weights": False,
     }
     return model_params_with_common_opts(
         config, config_params, inner_dim=config.intermediate_size

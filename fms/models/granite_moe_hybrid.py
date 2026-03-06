@@ -36,12 +36,12 @@ class GraniteMoeHybrid(Granite):
 
 _8b_config = GraniteConfig(
     src_vocab_size=100352,
-    emb_dim=4096,
+    emb_dim=2560,
     norm_eps=1e-5,
-    nheads=32,
+    nheads=40,
     kvheads=8,
     nlayers=40,
-    hidden_grow_factor=12800 / 4096,
+    hidden_grow_factor=8192/ 2560,
     max_expected_seq_len=8192,
     rope_theta=10000000,
     pad_id=100256,
