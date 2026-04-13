@@ -19,6 +19,7 @@ def pad_input_ids(
     is_causal_mask=True,
     padding_side="left",
     position_ids_offset=0,
+    pad_token_id=0,
 ) -> Tuple[torch.Tensor, MutableMapping[str, Any]]:
     """
     Convert a list of Tensors to a rectangular tensor. Return extra padding kwargs for the position_ids and mask, since
@@ -34,7 +35,8 @@ def pad_input_ids(
     position_ids_offset: int
         some models are trained with position_ids that do not start at 0 but at pad_id + 1. The default parameter
         here will work for most models, but for example MPNet requires passing a real pad_id.
-
+    pad_token_id: int
+        the token ID to use for padding. Default is 0.
     Returns
     -------
     Tuple[torch.Tensor, MutableMapping[str, Any]]
@@ -49,25 +51,34 @@ def pad_input_ids(
     position_ids_list = []
     for input_ids_i in input_ids_list:
         seq_len = input_ids_i.size(0)
-        pads = torch.zeros(
-            max_len - seq_len, dtype=torch.long, device=input_ids_i.device
+        pads = torch.full(
+            (max_len - seq_len,),
+            pad_token_id,
+            dtype=torch.long,
+            device=input_ids_i.device,
         )
         non_pads = torch.ones(seq_len, dtype=torch.bool, device=input_ids_i.device)
 
         # Setting this to 0, however if 0 is the eos, we will end up truncating the output if using truncate_after_eos
         # once this workflow works for nested tensor, this can probably be removed
 
-        pos_ids_pads = pads
+        pos_ids_pads = torch.zeros(
+            max_len - seq_len, dtype=torch.long, device=input_ids_i.device
+        )
         pos_ids_seq = torch.arange(
             0, seq_len, dtype=torch.long, device=input_ids_i.device
         )
         if padding_side == "left":
             padded_input_ids_list.append(torch.cat((pads, input_ids_i)))
-            mask_list.append(torch.cat((pads.bool(), non_pads)))
+            mask_list.append(
+                torch.cat((pads.bool(), non_pads))
+            )  # This will be False for pad tokens
             position_ids_list.append(torch.cat((pos_ids_pads, pos_ids_seq)))
         elif padding_side == "right":
             padded_input_ids_list.append(torch.cat((input_ids_i, pads)))
-            mask_list.append(torch.cat((non_pads, pads.bool())))
+            mask_list.append(
+                torch.cat((non_pads, pads.bool()))
+            )  # This will be False for pad tokens
             position_ids_list.append(torch.cat((pos_ids_seq, pos_ids_pads)))
         else:
             raise NotImplementedError("padding_side must be 'right' or left'")
@@ -173,6 +184,7 @@ def generate(
     use_cache: bool = False,
     contiguous_cache: bool = False,
     eos_token_id: Optional[int] = None,
+    pad_token_id: Optional[int] = None,
     timing: str = "",
     prepare_model_inputs_hook: Optional[
         Callable[
@@ -209,6 +221,7 @@ def generate(
             past_key_value_states args in forward method.
         contiguous_cache: ensures the cache is contiguous in device memory
         eos_token_id: the optional token id representing the end of sequence
+        pad_token_id: the optional token id representing the pad token
         timing: whether to measure timings: "per-token" for each token generation time,
             "e2e" for full generation loop. Both options make `generate` return a tuple
             with the following information:
@@ -263,6 +276,7 @@ def generate(
     eos_reached: bool = False
 
     for i in range(max_new_tokens):
+
         input_ids = next_input[:, -max_seq_len:]
 
         # prepare any padding keyword arguments
@@ -273,7 +287,13 @@ def generate(
         if prepare_model_inputs_hook is not None:
             input_ids, kwargs = prepare_model_inputs_hook(i, input_ids, kwargs)
 
+        print("="*80)
+        print(input_ids)
+        print("="*80)
+
         output = model(input_ids, **kwargs)
+
+
         if use_cache:
             logits, past_key_value_states = output
             # TODO: this should go away when reduce-overhead issues are fixed, or
@@ -290,6 +310,7 @@ def generate(
         else:
             logits = output
 
+
         # always get last now since we still have this dim
         logits = logits[:, -1, :]
 
@@ -304,6 +325,7 @@ def generate(
             next_val = torch.multinomial(probs, num_samples=1)
         else:
             next_val = torch.argmax(logits, dim=-1).unsqueeze(0).t()
+
 
         if post_iteration_hook is not None:
             next_val, kwargs = post_iteration_hook(
@@ -333,6 +355,7 @@ def generate(
         if eos_reached:
             break
 
+
     if timing == "e2e":
         if input_ids.device.type == "cuda":
             torch.cuda.synchronize()
@@ -344,6 +367,7 @@ def generate(
 
     if timing != "":
         return result, times
+
     return result
 
 

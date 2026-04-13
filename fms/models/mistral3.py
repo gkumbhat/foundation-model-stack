@@ -23,6 +23,7 @@ from fms.modules.layernorm import LayerNormParameterized
 from fms.models.mistral import MistralConfig, Mistral
 from fms.models.pixtral_vision import PixtralVisionConfig, PixtralVisionModel
 
+import time
 logger = logging.getLogger(__name__)
 
 
@@ -211,6 +212,8 @@ class Mistral3(nn.Module):
         input_ids: torch.Tensor,
         kwargs: dict[str, Any],
     ):
+
+        t0 = time.time()
         # NOTE: This is written to be compatible with Transformers, which
         # is how we should handle preprocessing here; not mistral-commons
         pixel_values = kwargs.get("pixel_values", None)
@@ -219,6 +222,7 @@ class Mistral3(nn.Module):
 
         embeds = self._get_text_embeddings(input_ids, input_embeds)
 
+        print("Time elapsed in text embedding computation: ", (time.time() - t0) * 1000)
         # Only consider image features at decode time
         if iteration == 0 and pixel_values is not None:
             # Standardize inputs & dtype
@@ -226,7 +230,9 @@ class Mistral3(nn.Module):
                 batch_size, _, height, width = pixel_values.shape
                 image_sizes = [(height, width)] * batch_size
 
+            t_image = time.time()
             img_features = self._get_image_features(pixel_values, image_sizes)
+            print("Time elapsed in image embedding computation: ", (time.time() - t_image) * 1000)
             embeds = self._merge_multimodal_embeddings(
                 input_ids,
                 embeds,
@@ -235,6 +241,8 @@ class Mistral3(nn.Module):
                 device=embeds.device,
             )
 
+        time_elapsed = (time.time() - t0) * 1000  # Convert seconds to milliseconds
+        print("Time elapsed in prepare_inputs_for_generation: %.2f ms" % time_elapsed)
         return embeds, kwargs
 
     def _get_text_embeddings(
