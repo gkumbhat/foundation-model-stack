@@ -287,9 +287,11 @@ def generate(
         if prepare_model_inputs_hook is not None:
             input_ids, kwargs = prepare_model_inputs_hook(i, input_ids, kwargs)
 
-        print("="*80)
-        print(input_ids)
-        print("="*80)
+            # Remove vision-specific kwargs after hook processes them
+            # These should not be passed to model.forward()
+            kwargs.pop("pixel_values", None)
+            kwargs.pop("image_sizes", None)
+            kwargs.pop("attention_mask", None)  # Also remove if present, as mask is used instead
 
         output = model(input_ids, **kwargs)
 
