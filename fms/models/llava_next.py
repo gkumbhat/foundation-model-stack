@@ -428,10 +428,25 @@ class LlavaNext(nn.Module):
         )
 
         image_features = image_features.to(inputs.device, inputs.dtype)
-        image_positions = (input_ids[0] == self.config.image_token_index).nonzero(
-            as_tuple=True
-        )[0]
-        inputs[0, image_positions] = image_features
+
+        # image_features is the concatenation of all per-image packed features.
+        # We need to distribute them back across batch rows: each row of inputs
+        # has its own set of image-token positions.
+        #
+        # Single-request (N==1): one iteration, same behaviour as before.
+        # Multi-request (N>1): each request contributes exactly one image so
+        # image_features from pack_image_features covers all of them in order;
+        # we split it back by counting image tokens per row.
+        offset = 0
+        for b in range(input_ids.shape[0]):
+            image_positions = (
+                input_ids[b] == self.config.image_token_index
+            ).nonzero(as_tuple=True)[0]
+            n = image_positions.shape[0]
+            if n == 0:
+                continue
+            inputs[b, image_positions] = image_features[offset : offset + n]
+            offset += n
         return inputs, kwargs
 
 
