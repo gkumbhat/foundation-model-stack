@@ -226,13 +226,11 @@ class Mistral3(nn.Module):
                 batch_size, _, height, width = pixel_values.shape
                 image_sizes = [(height, width)] * batch_size
 
-            # _get_image_features returns a list[Tensor], one per image.
-            # For the single-request case this is a one-element list.
-            img_features_per_image = self._get_image_features(pixel_values, image_sizes)
+            img_features = self._get_image_features(pixel_values, image_sizes)
             embeds = self._merge_multimodal_embeddings(
                 input_ids,
                 embeds,
-                img_features_per_image,
+                img_features,
                 dtype=embeds.dtype,
                 device=embeds.device,
             )
@@ -253,18 +251,7 @@ class Mistral3(nn.Module):
         self,
         pixel_values: torch.Tensor,
         image_sizes: list[tuple[int, int]],
-    ) -> list[torch.Tensor]:
-        """Run the vision encoder once for all supplied images and return a
-        list of per-image feature tensors, each of shape [n_tokens_i, emb_dim].
-
-        ``pixel_values`` shape: [total_patches, C, H, W] — all patches from
-        all images concatenated along dim 0 (pixtral's native layout).
-        ``image_sizes`` has one (height, width) entry per image.
-
-        Supports both single-request (len(image_sizes)==1) and batched
-        multi-request (len(image_sizes)==N) without any code-path branching:
-        the vision tower always runs once regardless of N.
-        """
+    ):
         # NOTE: 2 response values since unlike siglip/clip, we have no pooler;
         # we should refactor this to be wrapped in a class so that we can use
         # image encoders across different models more generically.
@@ -288,15 +275,16 @@ class Mistral3(nn.Module):
             ]
             selected_image_feature = torch.cat(hs_pool, dim=-1)
 
-        # Run the multimodal projector on selected features.
-        # squeeze(0) is safe: pixtral flattens all patches along dim 0 so the
-        # output is [1, total_tokens, hidden] regardless of how many images.
+        # Run the multimodal projector on selected features;
+        # squeeze batch dim for the image -> [sz, img_features].
+        # This is okay to do because pixtral flattens convolutional
+        # patches in the multi-image case, so img_features will be
+        # equal to the total number of image tokens and split by the
+        # projector's patch processor.
         selected_image_feature = selected_image_feature.squeeze(0)
         image_features = self.multi_modal_projector(selected_image_feature, image_sizes)
 
-        # Split into one tensor per image and return as a list.
-        # Each tensor is [n_tokens_i, emb_dim] where n_tokens_i depends on the
-        # image resolution after downsampling.
+        # Split out the stacked image features
         downsample_ratio = (
             self.config.vision_config.patch_size * self.config.spatial_merge_size
         )
@@ -304,30 +292,30 @@ class Mistral3(nn.Module):
             (height // downsample_ratio) * (width // downsample_ratio)
             for height, width in image_sizes
         ]
-        return list(torch.split(image_features.squeeze(0), split_sizes))
+        image_features = torch.split(image_features.squeeze(0), split_sizes)
+        image_features = torch.cat(image_features, dim=0)
+        return image_features
 
     def _merge_multimodal_embeddings(
         self,
         input_ids: torch.Tensor,
         text_embeds: torch.Tensor,
-        img_features_per_image: list[torch.Tensor],
+        img_features: torch.Tensor,
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Write per-image features into the image-token slots of text_embeds.
-
-        Supports batched input (text_embeds shape [N, seq_len, emb_dim]):
-        ``img_features_per_image[b]`` is written into row b of text_embeds.
-        For the single-request case N==1 and the loop runs once.
-
-        nonzero() returns indices in left-to-right order, so
-        img_features[k] -> text_embeds[b, image_positions[k]] is correct.
-        """
-        for b, img_features in enumerate(img_features_per_image):
-            image_positions = (
-                input_ids[b] == self.config.image_token_index
-            ).nonzero(as_tuple=True)[0]
-            text_embeds[b, image_positions] = img_features.to(dtype)
+        # Original used expand_as(text_embeds).to(device) which materialised a
+        # [batch, seq_len, emb_dim] bool tensor (~160 MB for 16K-token prompts),
+        # causing a ~91 ms aten::to on every MM prefill.
+        #
+        # Equivalent replacement: find image-token positions (tiny 1-D index
+        # tensor) and write directly.  nonzero() returns indices in left-to-right
+        # order, matching masked_scatter's row-major traversal, so the mapping
+        # img_features[k] -> text_embeds[b, image_positions[k]] is identical.
+        image_positions = (input_ids[0] == self.config.image_token_index).nonzero(
+            as_tuple=True
+        )[0]
+        text_embeds[0, image_positions] = img_features.to(dtype)
         return text_embeds
 
     def forward(
