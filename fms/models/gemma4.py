@@ -93,7 +93,9 @@ class Gemma4TextConfig(ModelConfig):
     qk_norm: bool = True  # per-head QK normalization (apply_norm_per_head)
     logit_softcapping: float = 30.0  # final_logit_softcapping
     tie_heads: bool = True
-    fused_weights: bool = True  # True for CPU/GPU, False for AIU
+    # Attention is always unfused (UnfusedQKV) because FusedQKV does not
+    # support per-head QK normalization.  fused_weights controls only the MLP.
+    fused_weights: bool = False
     pad_id: int = 0
     linear_config: Optional[Mapping[str, Any]] = None
 
@@ -102,6 +104,29 @@ _12b_config = Gemma4TextConfig()
 
 
 # =============== Modeling ======================
+
+
+class _NormedValueProjection(nn.Module):
+    """
+    Value projection (nn.Linear) followed by per-head RMSNorm without a learnable
+    scale — implements Gemma4's v_norm (Gemma4RMSNorm with with_scale=False).
+
+    Applied to value states after projection but before the attention dot-product.
+    Has no checkpoint weights; purely a runtime normalization.
+    """
+
+    def __init__(self, linear: nn.Linear, head_dim: int, eps: float):
+        super().__init__()
+        self.linear = linear
+        self.head_dim = head_dim
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.linear(x)
+        shape = out.shape
+        out = out.view(*shape[:-1], -1, self.head_dim)
+        out = out * torch.rsqrt(out.pow(2).mean(-1, keepdim=True) + self.eps)
+        return out.view(shape)
 
 
 class Gemma4Block(nn.Module):
@@ -115,23 +140,26 @@ class Gemma4Block(nn.Module):
             kvheads = self.config.kvheads
             assert self.config.nheads % self.config.kvheads == 0
 
-        self.ln = LayerNormParameterized(
-            self.config.emb_dim,
-            elementwise_scale=True,
-            elementwise_shift=False,
-            use_mean=False,
-            eps=self.config.norm_eps,
-            use_high_precision_pow=True,
-        )
-        self.ff_ln = LayerNormParameterized(
-            self.config.emb_dim,
-            elementwise_scale=True,
-            elementwise_shift=False,
-            use_mean=False,
-            eps=self.config.norm_eps,
-            use_high_precision_pow=True,
-        )
+        def _layernorm(emb_dim):
+            return LayerNormParameterized(
+                emb_dim,
+                elementwise_scale=True,
+                elementwise_shift=False,
+                use_mean=False,
+                eps=self.config.norm_eps,
+                use_high_precision_pow=True,
+            )
 
+        self.ln = _layernorm(self.config.emb_dim)           # input_layernorm
+        self.post_attn_ln = _layernorm(self.config.emb_dim) # post_attention_layernorm
+        self.ff_ln = _layernorm(self.config.emb_dim)        # pre_feedforward_layernorm
+        self.post_ff_ln = _layernorm(self.config.emb_dim)   # post_feedforward_layernorm
+
+        # Per-layer scalar — initialised to 1 (identity); trained to modulate output.
+        self.register_buffer("layer_scalar", torch.ones(1))
+
+        # Attention is always unfused: FusedQKV does not create q_norm/k_norm
+        # parameters, so per-head QK normalization requires UnfusedQKV.
         self.attn = MultiHeadAttention(
             self.config.emb_dim,
             self.config.head_dim,
@@ -141,12 +169,20 @@ class Gemma4Block(nn.Module):
             p_dropout=self.config.p_dropout,
             use_bias=False,
             position_encoder=rotary_emb,
-            fused=self.config.fused_weights,
+            fused=False,
             linear_config=self.config.linear_config,
             apply_norm_per_head=self.config.qk_norm,
             norm_eps=self.config.norm_eps if self.config.qk_norm else None,
             head_dim=self.config.head_dim,
         )
+        # v_norm: wrap the value projection with a no-scale per-head RMSNorm.
+        # Has no checkpoint weights (with_scale=False in HF).
+        self.attn.in_proj.value = _NormedValueProjection(
+            self.attn.in_proj.value,
+            head_dim=self.config.head_dim,
+            eps=self.config.norm_eps,
+        )
+
         self.ff_sub_layer = GatedLinearUnit(
             self.config.emb_dim,
             hidden_grow_factor=self.config.hidden_grow_factor,
@@ -186,6 +222,7 @@ class Gemma4Block(nn.Module):
             x, cache = x
         if self.config.p_dropout != 0:
             x = self.dropout(x)
+        x = self.post_attn_ln(x)
         x = x + residual
 
         residual = x
@@ -193,7 +230,10 @@ class Gemma4Block(nn.Module):
         x = self.ff_sub_layer(x)
         if self.config.p_dropout != 0:
             x = self.dropout(x)
+        x = self.post_ff_ln(x)
         x = x + residual
+
+        x = x * self.layer_scalar
 
         if use_cache:
             return (x, cache)
@@ -443,9 +483,9 @@ def _weight_fusion(
 
     new_sd = input_sd
     if has_fused_weights:
-        new_sd = serialization._mlp_glu_unfused_to_fused_adapter_step(
-            serialization._attn_unfused_to_fused_step(new_sd)
-        )
+        # Attention is always UnfusedQKV (required for q_norm/k_norm support),
+        # so only the MLP weights are fused.
+        new_sd = serialization._mlp_glu_unfused_to_fused_adapter_step(new_sd)
     return new_sd
 
 
@@ -492,11 +532,7 @@ def _hf_to_fms_names(
         "vision_tower.",
         "multi_modal_projector.",
     )
-    _DROP_SUFFIXES = (
-        ".layer_scalar",
-        ".post_attention_layernorm.weight",
-        ".post_feedforward_layernorm.weight",
-    )
+    _DROP_SUFFIXES = ()  # all layer keys are now mapped
 
     replacements = [
         (r"^model\.language_model\.embed_tokens", "base_model.embedding"),
@@ -505,15 +541,19 @@ def _hf_to_fms_names(
         (r"^model\.language_model\.lm_head\.weight", "head.weight"),
         (r"self_attn\.q_proj", "attn.in_proj.query"),
         (r"self_attn\.k_proj", "attn.in_proj.key"),
-        (r"self_attn\.v_proj", "attn.in_proj.value"),
+        # v_proj → value.linear because the value projection is wrapped in
+        # _NormedValueProjection (v_norm); the nn.Linear lives at .linear
+        (r"self_attn\.v_proj", "attn.in_proj.value.linear"),
         (r"self_attn\.o_proj", "attn.dense"),
-        (r"self_attn\.q_norm", "attn.q_norm"),
-        (r"self_attn\.k_norm", "attn.k_norm"),
+        (r"self_attn\.q_norm", "attn.in_proj.q_norm"),
+        (r"self_attn\.k_norm", "attn.in_proj.k_norm"),
         (r"mlp\.gate_proj", "ff_sub_layer.wg"),
         (r"mlp\.up_proj", "ff_sub_layer.w1"),
         (r"mlp\.down_proj", "ff_sub_layer.w2"),
         (r"input_layernorm", "ln"),
+        (r"post_attention_layernorm", "post_attn_ln"),
         (r"pre_feedforward_layernorm", "ff_ln"),
+        (r"post_feedforward_layernorm", "post_ff_ln"),
     ]
 
     layer_types = (
@@ -542,7 +582,11 @@ def _hf_to_fms_names(
         if "attn.in_proj.key" in new_name:
             m = _LAYER_IDX_RE.search(new_name)
             if m and int(m.group(1)) in full_attn_indices:
-                value_name = new_name.replace("attn.in_proj.key", "attn.in_proj.value")
+                # attention_k_eq_v=True: full-attention layers share K and V weights.
+                # The value projection lives at .value.linear (wrapped in v_norm).
+                value_name = new_name.replace(
+                    "attn.in_proj.key", "attn.in_proj.value.linear"
+                )
                 new_sd[value_name] = param
 
     return new_sd
@@ -601,8 +645,6 @@ serialization.register_adapter_step(
 _ATTN_SUBKEYS = (
     "attn.in_proj",
     "attn.dense",
-    ".q_norm.",
-    ".k_norm.",
 )
 
 
@@ -652,7 +694,7 @@ def _filter_sliding_attn_weights(
             n_dropped += 1
 
     if n_dropped:
-        logger.info(
+        logger.warning(
             f"Dropped {n_dropped} attention weight(s) from sliding-attention layers "
             "(identified by layer index via model_config.layer_types). "
             "Those layers will retain randomly initialised attention weights."
