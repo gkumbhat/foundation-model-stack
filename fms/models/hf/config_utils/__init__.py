@@ -47,6 +47,7 @@ __FMS_MODEL_REGISTRY_MAP: RegistryMap = {
     "BertForMaskedLM": ("bert", pb.build_bert_params),
     "Qwen3ForCausalLM": ("qwen3", pb.build_qwen3_embeddings_params),
     "Mistral3ForConditionalGeneration": ("mistral3", pb.build_mistral3_params),
+    "Gemma4UnifiedForConditionalGeneration": ("gemma4", pb.build_gemma4_params),
     # This mapping logic in FMS relies on mapping top level model_type in config.json to a particular class.
     # However, in case of ministral3 models, this still comes out to be mistral3, and not ministral3.
     # To distinguish between these models we add a special handling for ministral3 at this mapping layer, to get around this problem.

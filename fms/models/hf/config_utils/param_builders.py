@@ -451,6 +451,48 @@ def build_ministral3_text_params(config: PretrainedConfig) -> dict:  #
     )
 
 
+def build_gemma4_text_params(config: PretrainedConfig) -> dict:
+    """
+    Param builder for Gemma4 text sub-config (transformers 5+ only).
+
+    Since this FMS implementation disables sliding window attention, all layers
+    use the global-attention parameters:
+      - num_global_key_value_heads  -> kvheads
+      - global_head_dim             -> head_dim
+      - rope_parameters             -> rope_parameters (full dict passed through)
+      - layer_types                 -> layer_types
+
+    Transformers 5+ uses hidden_activation (not hidden_act).
+    """
+    config_params = {
+        "kvheads": config.num_global_key_value_heads,
+        "head_dim": config.global_head_dim,
+        "norm_eps": config.rms_norm_eps,
+        "emb_dim": config.hidden_size,
+        "max_expected_seq_len": config.max_position_embeddings,
+        "p_dropout": getattr(config, "attention_dropout", 0.0),
+        "activation_fn": config.hidden_activation,
+        "rope_parameters": dict(getattr(config, "rope_parameters", {})),
+        "layer_types": list(getattr(config, "layer_types", [])),
+        "logit_softcapping": getattr(config, "final_logit_softcapping", 30.0),
+        "pad_id": getattr(config, "pad_token_id", 0),
+    }
+    return model_params_with_common_opts(
+        config, config_params, inner_dim=config.intermediate_size
+    )
+
+
+def build_gemma4_params(config: PretrainedConfig) -> dict:
+    """Param builder for mapping Gemma4UnifiedForConditionalGeneration to FMS (transformers 5+ only)."""
+    text_config = config.text_config
+    if getattr(text_config, "model_type", None) != "gemma4_unified_text":
+        raise ValueError(
+            "FMS Gemma4 currently supports only 'gemma4_unified_text' language model; "
+            f"got '{getattr(text_config, 'model_type', None)}'"
+        )
+    return build_gemma4_text_params(text_config)
+
+
 def build_qwen3_embeddings_params(config: PretrainedConfig) -> dict:
     """Param builder for mapping Qwen3ForCausalLM to FMS."""
     rope_theta, _ = reverse_rope_param_lookup(config)
