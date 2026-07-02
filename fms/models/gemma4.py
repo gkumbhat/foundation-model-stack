@@ -122,11 +122,12 @@ class _NormedValueProjection(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.linear(x)
-        shape = out.shape
-        out = out.view(*shape[:-1], -1, self.head_dim)
-        out = out * torch.rsqrt(out.pow(2).mean(-1, keepdim=True) + self.eps)
-        return out.view(shape)
+        out = self.linear(x)  # (B, L, kvheads * head_dim)
+        # Per-head RMSNorm, no learnable scale (Gemma4 v_norm).
+        # kvheads=1 for Gemma4, so out is (B, L, head_dim) — one head.
+        # 3D mean(dim=2) stays on (B,L,D) with L pure in dim-1. Spyre-safe.
+        inv_rms = torch.rsqrt(out.pow(2).mean(2, keepdim=True) + self.eps)
+        return out * inv_rms
 
 
 class Gemma4Block(nn.Module):

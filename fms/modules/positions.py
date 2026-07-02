@@ -297,6 +297,7 @@ class RotaryEmbedding(PositionEncoder):
         """
         super(RotaryEmbedding, self).__init__()
         self.partial_rope = partial_rope
+        self.full_dim = dim
         self.dim = int(partial_rope * dim)
         own_scaling = copy.deepcopy(scaling)
         if "rope_type" not in own_scaling:
@@ -342,7 +343,7 @@ class RotaryEmbedding(PositionEncoder):
 
                     self.cached_freqs[dev_idx][alpha] = (cos, sin)
                 else:
-                    self.cached_freqs[dev_idx][alpha] = torch.stack(
+                    rot = torch.stack(
                         [
                             torch.cos(freqs),
                             -torch.sin(freqs),
@@ -351,6 +352,16 @@ class RotaryEmbedding(PositionEncoder):
                         ],
                         dim=2,
                     ).view(*freqs.size(), 2, 2)
+                    # For partial RoPE: pad with identity rotations for the
+                    # non-rotated dims so forward() can apply one rotation to
+                    # the full head_dim without any split/cat.
+                    if self.dim < self.full_dim:
+                        pad = (self.full_dim - self.dim) // 2
+                        eye = rot.new_zeros(rot.shape[0], pad, 2, 2)
+                        eye[:, :, 0, 0] = 1.0
+                        eye[:, :, 1, 1] = 1.0
+                        rot = torch.cat([rot, eye], dim=1)
+                    self.cached_freqs[dev_idx][alpha] = rot
 
         return alpha
 
@@ -406,14 +417,8 @@ class RotaryEmbedding(PositionEncoder):
         # the max start position should be based on the max first position of each sequence
         max_start_pos = torch.max(position_ids[:, 0])
 
-        if self.partial_rope != 1.0:
-            q_rope = q[..., : self.dim]
-            k_rope = k[..., : self.dim]
-        else:
-            q_rope = q
-            k_rope = k
-        q_ = q_rope.float().view(*q.size()[:-1], -1, 2)  # B L H D/2 2
-        k_ = k_rope.float().view(*k.size()[:-1], -1, 2)  # B L H D/2 2
+        q_ = q.float().view(*q.size()[:-1], -1, 2)  # B L H D/2 2
+        k_ = k.float().view(*k.size()[:-1], -1, 2)  # B L H D/2 2
 
         # the max start position should be based on the max first position of each sequence
         max_start_pos = torch.max(position_ids[:, 0])
@@ -451,12 +456,8 @@ class RotaryEmbedding(PositionEncoder):
             .flatten(3)
         ).type_as(k)
 
-        if self.partial_rope != 1.0:
-            q_out = torch.cat([q_out.view_as(q_rope), q[..., self.dim :]], dim=-1)
-            k_out = torch.cat([k_out.view_as(k_rope), k[..., self.dim :]], dim=-1)
-        else:
-            q_out = q_out.view_as(q_rope)
-            k_out = k_out.view_as(k_rope)
+        q_out = q_out.view_as(q)
+        k_out = k_out.view_as(k)
         return q_out, k_out
 
 
